@@ -1,0 +1,40 @@
+# Archivos compilados
+x11_keylogger
+*.o
+*.out
+*.exe
+
+# Archivos de log generados
+keylog.txt
+*.log
+
+# Archivos temporales
+*~
+*.swp
+*.swo
+.*.swp
+
+# Directorios de compilación
+build/
+dist/
+*.dSYM/
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# IDEs y editores
+.vscode/
+.idea/
+*.sublime-*
+.project
+.cproject
+.settings/
+
+# Core dumps
+core
+core.*
+
+# Archivos de backup
+*.bak
+*.backup

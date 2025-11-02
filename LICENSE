@@ -1,0 +1,78 @@
+MIT License with Educational Use Restrictions
+
+Copyright (c) 2025 Jrgil20
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction for EDUCATIONAL AND RESEARCH PURPOSES ONLY,
+including without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to permit
+persons to whom the Software is furnished to do so, subject to the following
+conditions:
+
+ETHICAL USE REQUIREMENTS:
+
+1. This software is provided EXCLUSIVELY for educational and security research
+   purposes to demonstrate vulnerabilities in X11 systems.
+
+2. Users MUST NOT use this software for any illegal, malicious, or unauthorized
+   purposes including but not limited to:
+   - Unauthorized monitoring of computer systems
+   - Theft of credentials, passwords, or personal information
+   - Corporate espionage or competitive intelligence gathering
+   - Stalking, harassment, or invasion of privacy
+   - Any activity that violates local, national, or international laws
+
+3. Users MUST obtain explicit written permission before running this software
+   on any system they do not own or have authorization to test.
+
+4. Users MUST comply with all applicable laws and regulations regarding
+   computer security, privacy, and data protection in their jurisdiction.
+
+5. This software should be used to:
+   - Understand security vulnerabilities in X11
+   - Develop and test security countermeasures
+   - Educate others about computer security risks
+   - Promote migration to more secure alternatives (e.g., Wayland)
+
+6. Users acknowledge that unauthorized use of keyloggers may result in:
+   - Criminal prosecution
+   - Civil liability
+   - Imprisonment
+   - Substantial fines
+   - Permanent criminal record
+
+DISCLAIMER:
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The author(s) of this software:
+- Provide this code solely for educational purposes
+- Do NOT endorse or encourage illegal activities
+- Are NOT responsible for misuse of this software
+- Explicitly warn against unauthorized use
+- Promote ethical and legal use of security research tools
+
+BY USING THIS SOFTWARE, YOU AGREE TO:
+1. Use it only for legal and ethical purposes
+2. Take full responsibility for your actions
+3. Not hold the author(s) liable for any consequences of misuse
+4. Respect the privacy and security of others
+5. Comply with all applicable laws and regulations
+
+If you do not agree with these terms, you are NOT permitted to use this
+software.
+
+---
+
+This license is based on the MIT License with additional restrictions for
+educational use. The standard MIT license text follows:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
