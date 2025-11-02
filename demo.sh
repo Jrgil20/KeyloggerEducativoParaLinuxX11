@@ -162,7 +162,7 @@ cleanup() {
     echo -e "\n${YELLOW}Limpieza...${NC}"
     echo -e "${BLUE}¿Deseas eliminar el archivo de log? (s/n)${NC}"
     read -r response
-    if [[ "$response" =~ ^[Ss]$ ]]; then
+    if [ "$response" = "s" ] || [ "$response" = "S" ]; then
         rm -f keylog.txt
         echo -e "${GREEN}✓ Log eliminado${NC}"
     else
