@@ -38,3 +38,6 @@ core.*
 # Archivos de backup
 *.bak
 *.backup
+
+# CodeQL artifacts
+_codeql_detected_source_root
