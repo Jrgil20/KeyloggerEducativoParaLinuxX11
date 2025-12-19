@@ -88,6 +88,7 @@ make help
 ```
 
 El programa:
+
 1. Mostrará advertencias legales
 2. Solicitará confirmación (escribir 's' para continuar)
 3. Comenzará a capturar eventos de teclado
@@ -98,7 +99,7 @@ El programa:
 
 ### Ejemplo de Salida
 
-```
+``` bash
 [2025-11-02 10:30:45] [Firefox - Mozilla] password
 [2025-11-02 10:30:48] [Firefox - Mozilla] [ENTER]
 [2025-11-02 10:30:50] [Terminal - bash] ls -la
@@ -121,6 +122,7 @@ XGrabKeyboard(display, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
 ```
 
 **Sin requerir**:
+
 - ❌ Privilegios de root
 - ❌ Permisos especiales
 - ❌ Autorización del usuario
@@ -156,6 +158,7 @@ echo $XDG_SESSION_TYPE
    - Permisos granulares
 
 2. **Detectar keyloggers**
+
    ```bash
    # Listar procesos sospechosos
    ps aux | grep -i key
@@ -175,7 +178,7 @@ echo $XDG_SESSION_TYPE
 
 ## 📂 Estructura del Proyecto
 
-```
+``` bash
 KeyloggerEducativoParaLinuxX11/
 ├── README.md                 # Este archivo
 ├── DOCUMENTACION.md          # Documentación técnica detallada
@@ -189,7 +192,7 @@ KeyloggerEducativoParaLinuxX11/
 ## 📊 Comparación de Seguridad
 
 | Sistema/Protocolo | Aislamiento | Permisos Requeridos | Notificación Usuario |
-|------------------|-------------|---------------------|---------------------|
+| :-: | :-: | :-: | :-: |
 | **X11** | ❌ No | ❌ Ninguno | ❌ No |
 | **Wayland** | ✅ Sí | ✅ Explícitos | ✅ Sí |
 | **Windows** | ⚠️ Parcial | ✅ Admin (UAC) | ⚠️ Limitada |
@@ -199,7 +202,7 @@ KeyloggerEducativoParaLinuxX11/
 
 ## 🎓 Recursos Educativos
 
-- [Documentación Técnica Completa](DOCUMENTACION.md)
+- [Documentación Técnica Completa](docs/DOCUMENTACION.md)
 - [X11 Protocol Specification](https://www.x.org/releases/current/doc/xproto/x11protocol.html)
 - [Wayland Security Model](https://wayland.freedesktop.org/docs/html/ch04.html#sect-Wayland-Security)
 - [OWASP - Input Validation](https://owasp.org/www-community/vulnerabilities/)
@@ -230,16 +233,19 @@ Este proyecto se distribuye bajo licencia MIT con las siguientes condiciones adi
 
 ---
 
-## 👤 Autor
+## 👤 Autors
 
-**Jrgil20**
+Jrgil20
 - GitHub: [@Jrgil20](https://github.com/Jrgil20)
+
+Co-authored-by: David E. Hidalgo V. <David-Hidalgo@users.noreply.github.com>
 
 ---
 
 ## ⚖️ Responsabilidad
 
 El autor de este proyecto:
+
 - ✅ Proporciona este código con fines educativos
 - ✅ Advierte sobre las implicaciones legales
 - ✅ Promueve el uso ético y responsable
