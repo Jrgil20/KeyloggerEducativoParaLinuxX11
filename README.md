@@ -157,22 +157,163 @@ echo $XDG_SESSION_TYPE
    - Aislamiento entre aplicaciones
    - Permisos granulares
 
-2. **Detectar keyloggers**
-
-   ```bash
-   # Listar procesos sospechosos
-   ps aux | grep -i key
-   ps aux | grep X11
-   
-   # Verificar conexiones X11
-   lsof | grep X11
-   ```
+2. **Detectar keyloggers** (ver sección detallada más abajo)
 
 3. **Buenas prácticas**
    - Solo ejecutar aplicaciones de fuentes confiables
    - Auditar regularmente procesos en ejecución
    - Usar herramientas de detección de malware
    - Mantener el sistema actualizado
+
+---
+
+## 🔍 Cómo Detectar Este Keylogger
+
+Esta sección es **educativa** y demuestra que aunque el keylogger puede ocultarse de usuarios casuales, **siempre es detectable** por administradores o herramientas de seguridad.
+
+### Nivel de Ocultamiento
+
+| Método | Usuario Casual | Admin/Seguridad |
+|--------|:--------------:|:---------------:|
+| `ps aux` | ⚠️ Camuflado como `kworker/0:0` | ✅ Detectable |
+| `top`/`htop` | ⚠️ Nombre camuflado | ✅ Detectable |
+| `/proc` | N/A | ✅ Completamente expuesto |
+| `lsof` | N/A | ✅ Muestra archivos abiertos |
+| Antivirus | N/A | ✅ Detecta comportamiento |
+
+### Métodos de Detección
+
+#### 1. Buscar procesos falsos de kernel
+
+El keylogger en modo daemon usa el nombre `kworker/0:0`. Los procesos reales del kernel tienen características específicas:
+
+```bash
+# Los kworker REALES tienen PPID = 2 (kthreadd)
+ps -eo pid,ppid,comm | grep kworker
+
+# Si ves un kworker con PPID != 2, es FALSO
+# Ejemplo de salida sospechosa:
+#   12345  1234  kworker/0:0   ← FALSO (PPID no es 2)
+#   15     2     kworker/0:0   ← REAL  (PPID es 2)
+```
+
+#### 2. Verificar el binario real en /proc
+
+```bash
+# Encontrar PIDs de procesos llamados kworker
+for pid in $(pgrep -f "kworker/0:0"); do
+    echo "=== PID: $pid ==="
+    # Ver el ejecutable real
+    ls -la /proc/$pid/exe 2>/dev/null
+    # Ver la línea de comandos original
+    cat /proc/$pid/cmdline 2>/dev/null; echo
+done
+
+# Un proceso REAL del kernel mostrará:
+#   /proc/15/exe -> (ningún enlace, error)
+# 
+# Este keylogger mostrará:
+#   /proc/12345/exe -> /home/user/x11_keylogger   ← ¡EXPUESTO!
+```
+
+#### 3. Buscar conexiones a X11
+
+```bash
+# Listar procesos con conexiones al servidor X11
+lsof -i -P | grep -E ":(6000|X11)"
+
+# O buscar sockets Unix de X11
+lsof | grep /tmp/.X11-unix
+
+# El keylogger aparecerá con DOS conexiones a X11
+# (una para eventos, otra para grabación)
+```
+
+#### 4. Buscar archivos de log abiertos
+
+```bash
+# Buscar procesos que tengan abierto keylog.txt
+lsof | grep keylog
+
+# O buscar cualquier archivo .txt sospechoso
+lsof +D /tmp 2>/dev/null | grep -E "\.txt|\.log"
+```
+
+#### 5. Analizar el comportamiento con strace
+
+```bash
+# Adjuntar a un proceso sospechoso
+sudo strace -p <PID> -e read,write
+
+# Si es un keylogger, verás:
+# - Lecturas constantes del socket X11
+# - Escrituras al archivo de log
+```
+
+#### 6. Script de detección automática
+
+```bash
+#!/bin/bash
+# detector_keylogger.sh - Detecta keyloggers X11 sospechosos
+
+echo "=== Detector de Keyloggers X11 ==="
+echo ""
+
+# Buscar kworkers falsos
+echo "[1] Buscando procesos kworker sospechosos..."
+for pid in $(pgrep -f "kworker"); do
+    ppid=$(ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')
+    if [ "$ppid" != "2" ] && [ -n "$ppid" ]; then
+        exe=$(readlink /proc/$pid/exe 2>/dev/null)
+        echo "  ⚠️  SOSPECHOSO: PID=$pid, PPID=$ppid, EXE=$exe"
+    fi
+done
+
+# Buscar procesos con múltiples conexiones X11
+echo ""
+echo "[2] Procesos con conexiones X11 (sin terminal)..."
+lsof 2>/dev/null | grep X11-unix | awk '{print $2}' | sort | uniq -c | \
+    while read count pid; do
+        if [ "$count" -ge 2 ]; then
+            comm=$(ps -o comm= -p $pid 2>/dev/null)
+            echo "  ⚠️  PID=$pid tiene $count conexiones X11 ($comm)"
+        fi
+    done
+
+# Buscar archivos de log típicos
+echo ""
+echo "[3] Archivos de log sospechosos abiertos..."
+lsof 2>/dev/null | grep -iE "keylog|keys\.txt|log\.txt" | head -5
+
+echo ""
+echo "=== Fin del análisis ==="
+```
+
+### Herramientas de Detección Recomendadas
+
+| Herramienta | Uso | Comando |
+|-------------|-----|---------|
+| **rkhunter** | Detectar rootkits | `sudo rkhunter --check` |
+| **chkrootkit** | Escaneo de sistema | `sudo chkrootkit` |
+| **ClamAV** | Antivirus | `clamscan -r /home` |
+| **auditd** | Auditoría de syscalls | `ausearch -k keylogger` |
+| **ps/proc** | Análisis manual | Ver comandos arriba |
+
+### Para Detener el Keylogger
+
+```bash
+# Encontrar el PID real
+pid=$(for p in $(pgrep -f "kworker/0:0"); do
+    ppid=$(ps -o ppid= -p $p | tr -d ' ')
+    [ "$ppid" != "2" ] && echo $p
+done)
+
+# Terminar el proceso
+kill $pid
+
+# O forzar terminación
+kill -9 $pid
+```
 
 ---
 

