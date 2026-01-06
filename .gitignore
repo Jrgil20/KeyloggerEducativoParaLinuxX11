@@ -8,6 +8,10 @@ x11_keylogger
 keylog.txt
 *.log
 
+# Variables de entorno con credenciales sensibles
+.env
+!.env.example
+
 # Archivos temporales
 *~
 *.swp

