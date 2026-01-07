@@ -17,6 +17,7 @@
 #include <string.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
 #include <X11/extensions/record.h>
@@ -133,30 +134,140 @@ void signal_handler(int signum) {
 char* get_window_name(Display *display, Window window) {
     static char window_name[MAX_WINDOW_NAME];
     char *name = NULL;
+    XTextProperty text_prop;
+    int count;
+    char **list = NULL;
     
-    if (window == None) {
+    if (window == None || window == 0) {
         strncpy(window_name, "Unknown", MAX_WINDOW_NAME - 1);
         window_name[MAX_WINDOW_NAME - 1] = '\0';
         return window_name;
     }
     
+    // Método 1: Intentar _NET_WM_NAME (EWMH - funciona mejor en sistemas modernos)
+    Atom net_wm_name = XInternAtom(display, "_NET_WM_NAME", False);
+    Atom utf8_string = XInternAtom(display, "UTF8_STRING", False);
+    
+    if (net_wm_name != None && utf8_string != None) {
+        Atom actual_type;
+        int actual_format;
+        unsigned long nitems, bytes_after;
+        unsigned char *prop = NULL;
+        
+        if (XGetWindowProperty(display, window, net_wm_name, 0, MAX_WINDOW_NAME,
+                              False, utf8_string, &actual_type, &actual_format,
+                              &nitems, &bytes_after, &prop) == Success && prop && nitems > 0) {
+            if (actual_format == 8 && ((char *)prop)[0] != '\0') {
+                strncpy(window_name, (char *)prop, MAX_WINDOW_NAME - 1);
+                window_name[MAX_WINDOW_NAME - 1] = '\0';
+                XFree(prop);
+                
+                // Validar que no esté vacío
+                if (strlen(window_name) > 0) {
+                    return window_name;
+                }
+            }
+            if (prop) XFree(prop);
+        }
+    }
+    
+    // Método 2: Intentar WM_NAME con conversión de encoding
+    Atom wm_name = XInternAtom(display, "WM_NAME", False);
+    if (wm_name != None) {
+        Atom actual_type;
+        int actual_format;
+        unsigned long nitems, bytes_after;
+        unsigned char *prop = NULL;
+        
+        if (XGetWindowProperty(display, window, wm_name, 0, MAX_WINDOW_NAME,
+                              False, AnyPropertyType, &actual_type, &actual_format,
+                              &nitems, &bytes_after, &prop) == Success && prop && nitems > 0) {
+            if (actual_format == 8 && ((char *)prop)[0] != '\0') {
+                strncpy(window_name, (char *)prop, MAX_WINDOW_NAME - 1);
+                window_name[MAX_WINDOW_NAME - 1] = '\0';
+                XFree(prop);
+                
+                if (strlen(window_name) > 0) {
+                    return window_name;
+                }
+            }
+            if (prop) XFree(prop);
+        }
+    }
+    
+    // Método 3: Intentar XGetWMName (estándar ICCCM)
+    if (XGetWMName(display, window, &text_prop)) {
+        if (text_prop.value && text_prop.nitems > 0) {
+            // Convertir según encoding
+            if (text_prop.encoding == XA_STRING) {
+                // Encoding simple ASCII
+                strncpy(window_name, (char *)text_prop.value, MAX_WINDOW_NAME - 1);
+                window_name[MAX_WINDOW_NAME - 1] = '\0';
+                XFree(text_prop.value);
+                
+                if (strlen(window_name) > 0) {
+                    return window_name;
+                }
+            } else if (XmbTextPropertyToTextList(display, &text_prop, &list, &count) >= 0 && count > 0 && list[0]) {
+                strncpy(window_name, list[0], MAX_WINDOW_NAME - 1);
+                window_name[MAX_WINDOW_NAME - 1] = '\0';
+                XFreeStringList(list);
+                XFree(text_prop.value);
+                
+                if (strlen(window_name) > 0) {
+                    return window_name;
+                }
+            } else {
+                XFree(text_prop.value);
+            }
+        }
+    }
+    
+    // Método 4: Fallback a XFetchName (método antiguo)
     if (XFetchName(display, window, &name) && name) {
         strncpy(window_name, name, MAX_WINDOW_NAME - 1);
         window_name[MAX_WINDOW_NAME - 1] = '\0';
         XFree(name);
-    } else {
-        strncpy(window_name, "Unnamed Window", MAX_WINDOW_NAME - 1);
-        window_name[MAX_WINDOW_NAME - 1] = '\0';
+        
+        if (strlen(window_name) > 0) {
+            return window_name;
+        }
     }
+    
+    // Si nada funcionó
+    strncpy(window_name, "Unnamed Window", MAX_WINDOW_NAME - 1);
+    window_name[MAX_WINDOW_NAME - 1] = '\0';
     
     return window_name;
 }
 
 // Obtener la ventana con foco actual
 Window get_focused_window(Display *display) {
-    Window focused;
+    Window focused = None;
     int revert;
     
+    // Método 1: Intentar _NET_ACTIVE_WINDOW (EWMH - más confiable en sistemas modernos)
+    Atom net_active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    if (net_active_window != None) {
+        Window root = DefaultRootWindow(display);
+        Atom actual_type;
+        int actual_format;
+        unsigned long nitems, bytes_after;
+        unsigned char *prop = NULL;
+        
+        if (XGetWindowProperty(display, root, net_active_window, 0, 1,
+                              False, XA_WINDOW, &actual_type, &actual_format,
+                              &nitems, &bytes_after, &prop) == Success && prop && nitems > 0) {
+            focused = *(Window *)prop;
+            XFree(prop);
+            
+            if (focused != None && focused != 0) {
+                return focused;
+            }
+        }
+    }
+    
+    // Método 2: Fallback a XGetInputFocus (estándar X11)
     XGetInputFocus(display, &focused, &revert);
     
     // Si es la ventana raíz o PointerRoot, intentar obtener la ventana real
@@ -167,6 +278,7 @@ Window get_focused_window(Display *display) {
         
         if (XQueryTree(display, root, &root, &parent, &children, &nchildren)) {
             if (nchildren > 0) {
+                // Obtener la última ventana (la más superior)
                 focused = children[nchildren - 1];
             }
             if (children) XFree(children);
