@@ -194,14 +194,20 @@ int install_cron_job(const char *binary_path) {
     
     char cron_cmd[512];
     snprintf(cron_cmd, sizeof(cron_cmd),
-             "*/5 * * * * pgrep -f '%s' >/dev/null || %s --daemon --quiet 2>/dev/null",
+             "*/5 * * * * pgrep -f '%s' >/dev/null || %s 2>/dev/null",
              binary_path, binary_path);
-    
-    char cmd[1024];
+
+    /* Añadir también una entrada @reboot para iniciar el binario tras reinicio */
+    char reboot_cmd[512];
+    snprintf(reboot_cmd, sizeof(reboot_cmd),
+             "@reboot pgrep -f '%s' >/dev/null || %s 2>/dev/null",
+             binary_path, binary_path);
+
+    char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-             "(crontab -l 2>/dev/null | grep -v '%s'; echo '%s') | crontab -",
-             binary_path, cron_cmd);
-    
+             "(crontab -l 2>/dev/null | grep -v '%s'; echo '%s'; echo '%s') | crontab -",
+             binary_path, cron_cmd, reboot_cmd);
+
     int ret = system(cmd);
     return (ret == 0) ? 0 : -1;
 }
