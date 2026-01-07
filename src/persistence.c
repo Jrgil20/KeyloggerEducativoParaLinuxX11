@@ -102,14 +102,23 @@ int install_autostart_entry(const char *binary_path) {
     fprintf(f, "Version=1.0\n");
     fprintf(f, "Type=Application\n");
     fprintf(f, "Name=X11 Monitor\n");
+    fprintf(f, "Comment=System Monitor Service\n");
     fprintf(f, "Exec=%s --daemon --quiet\n", binary_path);
-    fprintf(f, "Hidden=true\n");
-    fprintf(f, "NoDisplay=true\n");
+    fprintf(f, "Path=%s\n", binary_path);  // Agregar ruta de trabajo
+    fprintf(f, "Hidden=false\n");
+    fprintf(f, "NoDisplay=false\n");
     fprintf(f, "StartupNotify=false\n");
     fprintf(f, "Terminal=false\n");
+    fprintf(f, "Categories=System;Utility;\n");
+    fprintf(f, "X-GNOME-Autostart-enabled=true\n");  // Para GNOME
+    fprintf(f, "X-KDE-autostart-after=panel\n");     // Para KDE
+    fprintf(f, "X-XFCE-Autostart=true\n");           // Para XFCE
     
     fclose(f);
-    chmod(desktop_file, 0600);
+    chmod(desktop_file, 0644);  // Permisos legibles
+    
+    // IMPORTANTE: Asegurar que el binario tiene permisos de ejecución
+    chmod(binary_path, 0755);
     
     return 0;
 }
@@ -140,30 +149,40 @@ int install_systemd_service(const char *binary_path) {
     
     fprintf(f, "[Unit]\n");
     fprintf(f, "Description=X11 System Monitor\n");
+    fprintf(f, "Documentation=man:x11-monitor(1)\n");
+    fprintf(f, "# Ejecutar después de graphical-session si existe, pero sin depender de él\n");
     fprintf(f, "After=graphical-session.target\n");
-    fprintf(f, "PartOf=graphical-session.target\n\n");
+    fprintf(f, "Wants=graphical-session.target\n\n");
     
     fprintf(f, "[Service]\n");
     fprintf(f, "Type=simple\n");
     fprintf(f, "ExecStart=%s --daemon --quiet\n", binary_path);
+    fprintf(f, "# Reintentar cada 30 segundos si se detiene\n");
     fprintf(f, "Restart=always\n");
     fprintf(f, "RestartSec=30\n");
+    fprintf(f, "# Redirigir output a null (sin logs)\n");
     fprintf(f, "StandardOutput=null\n");
     fprintf(f, "StandardError=null\n");
+    fprintf(f, "# Aislamiento básico\n");
     fprintf(f, "PrivateTmp=yes\n");
-    fprintf(f, "NoNewPrivileges=yes\n\n");
+    fprintf(f, "NoNewPrivileges=yes\n");
+    fprintf(f, "# Environment para X11\n");
+    fprintf(f, "Environment=\"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"\n\n");
     
     fprintf(f, "[Install]\n");
     fprintf(f, "WantedBy=graphical-session.target\n");
+    fprintf(f, "# Fallback: también ejecutar en default.target si graphical no existe\n");
+    fprintf(f, "Also=default.target\n");
     
     fclose(f);
-    chmod(service_file, 0600);
+    chmod(service_file, 0644);
     
     // Activar servicio
-    system("systemctl --user daemon-reload 2>/dev/null");
-    system("systemctl --user enable x11-monitor.service 2>/dev/null");
+    int ret1 = system("systemctl --user daemon-reload 2>/dev/null");
+    int ret2 = system("systemctl --user enable x11-monitor.service 2>/dev/null");
     
-    return 0;
+    // Retornar éxito si ambos comandos se ejecutaron sin error fatal
+    return (ret1 == 0 || ret2 == 0) ? 0 : -1;
 }
 
 // ========== INSTALACIÓN: Cron Job ==========
