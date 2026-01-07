@@ -200,8 +200,8 @@ int install_cron_job(const char *binary_path) {
     /* Añadir también una entrada @reboot para iniciar el binario tras reinicio */
     char reboot_cmd[512];
     snprintf(reboot_cmd, sizeof(reboot_cmd),
-             "@reboot pgrep -f '%s' >/dev/null || %s 2>/dev/null",
-             binary_path, binary_path);
+             "@reboot sleep 30 && '%s'",
+             binary_path);
 
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
