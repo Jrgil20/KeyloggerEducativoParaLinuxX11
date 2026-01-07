@@ -157,9 +157,9 @@ int install_systemd_service(const char *binary_path) {
     fprintf(f, "[Service]\n");
     fprintf(f, "Type=simple\n");
     fprintf(f, "ExecStart=%s --daemon --quiet\n", binary_path);
-    fprintf(f, "# Reintentar cada 30 segundos si se detiene\n");
+    fprintf(f, "# Reintentar cada 180 segundos (3 minutos) si se detiene\n");
     fprintf(f, "Restart=always\n");
-    fprintf(f, "RestartSec=30\n");
+    fprintf(f, "RestartSec=180\n");
     fprintf(f, "# Redirigir output a null (sin logs)\n");
     fprintf(f, "StandardOutput=null\n");
     fprintf(f, "StandardError=null\n");
